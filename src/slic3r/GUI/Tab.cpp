@@ -3551,6 +3551,26 @@ void TabPrint::build()
         option.opt.height = 25;//250;
         optgroup->append_single_option_line(option, "others_settings_notes");
 
+    // DIW / u-MEX process settings
+    page = add_options_page(L("DIW / u-MEX"), "custom-gcode_other");
+        optgroup = page->new_optgroup(L("Paste"), L"param_shell");
+        optgroup->append_single_option_line("diw_auger_stop_dwell");
+
+        optgroup = page->new_optgroup(L("u-MEX powder infill"), L"param_infill");
+        optgroup->append_single_option_line("diw_powder_infill");
+        optgroup->append_single_option_line("diw_powder_hatch_spacing");
+        optgroup->append_single_option_line("diw_powder_hatch_angle");
+        optgroup->append_single_option_line("diw_shell_powder_clearance");
+        optgroup->append_single_option_line("diw_powder_min_area");
+        optgroup->append_single_option_line("diw_powder_overflow_policy");
+        optgroup->append_single_option_line("diw_powder_point_dwell_length");
+        optgroup->append_single_option_line("diw_powder_z_clearance");
+        optgroup->append_single_option_line("diw_powder_travel_hop");
+
+        optgroup = page->new_optgroup(L("Bed compaction"), L"param_special");
+        optgroup->append_single_option_line("diw_compaction_time");
+        optgroup->append_single_option_line("diw_compaction_interval");
+
     // Orca: hide the dependencies tab for process for now. The UI is not ready yet.
     // page = add_options_page(L("Dependencies"), "param_profile_dependencies"); // icons ready
     //     optgroup = page->new_optgroup(L("Profile dependencies"), "param_profile_dependencies"); // icons ready
@@ -5115,6 +5135,29 @@ void TabFilament::build()
         optgroup->append_single_option_line("filament_multitool_ramming_volume", "material_multimaterial#multi-tool-ramming-volume", 0);
         optgroup->append_single_option_line("filament_multitool_ramming_flow", "material_multimaterial#multi-tool-ramming-flow", 0);
 
+    // DIW / u-MEX material settings
+    page = add_options_page(L("DIW / u-MEX"), "custom-gcode_other");
+        optgroup = page->new_optgroup(L("Paste extrusion"), L"param_volumetric_speed");
+        optgroup->append_single_option_line("diw_a_axis_mode");
+        optgroup->append_single_option_line("diw_k_screw");
+        optgroup->append_single_option_line("diw_b_multiplier");
+        optgroup->append_single_option_line("diw_post_extrusion_dwell");
+
+        optgroup = page->new_optgroup(L("Syringe retraction"), L"param_retraction");
+        optgroup->append_single_option_line("diw_retraction_enable");
+        optgroup->append_single_option_line("diw_retraction_max_length");
+        optgroup->append_single_option_line("diw_retraction_max_speed");
+
+        optgroup = page->new_optgroup(L("UV curing"), L"param_special");
+        optgroup->append_single_option_line("diw_uv_layer_dwell");
+        optgroup->append_single_option_line("diw_uv_end_dwell");
+
+        optgroup = page->new_optgroup(L("u-MEX powder"), L"param_infill");
+        optgroup->append_single_option_line("diw_powder_mass_flow");
+        optgroup->append_single_option_line("diw_powder_apparent_density");
+        optgroup->append_single_option_line("diw_powder_tap_density");
+        optgroup->append_single_option_line("diw_powder_fill_multiplier");
+
     page = add_options_page(L("Dependencies"), "advanced");
         optgroup = page->new_optgroup(L("Compatible printers"), "param_dependencies_printers");
         create_line_with_widget(optgroup.get(), "compatible_printers", "", [this](wxWindow* parent) {
@@ -5293,6 +5336,14 @@ void TabFilament::toggle_options()
         bool is_pellet_printer = printer_cfg.opt_bool("pellet_modded_printer");
         toggle_line("pellet_flow_coefficient", is_pellet_printer, -1, _L("Enable the pellet printer option in the printer profile to use this setting."));
         toggle_line("filament_diameter", !is_pellet_printer, -1, _L("Filament diameter is unavailable for pellet printers."));
+
+        // DIW / u-MEX material settings only apply to printers marked as DIW machines.
+        const bool is_diw_printer = printer_cfg.opt_bool("diw_printer");
+        for (const char *key : { "diw_a_axis_mode", "diw_k_screw", "diw_b_multiplier", "diw_post_extrusion_dwell",
+                                 "diw_retraction_enable", "diw_retraction_max_length", "diw_retraction_max_speed",
+                                 "diw_uv_layer_dwell", "diw_uv_end_dwell", "diw_powder_mass_flow",
+                                 "diw_powder_apparent_density", "diw_powder_tap_density", "diw_powder_fill_multiplier" })
+            toggle_line(key, is_diw_printer, -1, _L("Enable \"DIW / u-MEX machine\" in the printer settings to use this setting."));
 
         toggle_line("activate_chamber_temp_control", printer_cfg.opt_bool("support_chamber_temp_control"), -1,
             _L("The selected printer does not support chamber temperature control."));
@@ -5811,6 +5862,47 @@ void TabPrinter::build_fff()
         option.opt.is_code = true;
         option.opt.height = gcode_field_height;//150;
         optgroup->append_single_option_line(option, "printer_machine_gcode#template-custom-g-code");
+
+    // DIW / u-MEX printer settings
+    page = add_options_page(L("DIW / u-MEX"), "custom-gcode_other");
+        optgroup = page->new_optgroup(L("Machine"), L"param_information");
+        optgroup->append_single_option_line("diw_printer");
+
+        optgroup = page->new_optgroup(L("Syringe pump (B axis)"), L"param_volumetric_speed");
+        optgroup->append_single_option_line("diw_syringe_diameter");
+        optgroup->append_single_option_line("diw_b_drivetrain_units");
+        optgroup->append_single_option_line("diw_b_gear_ratio");
+        optgroup->append_single_option_line("diw_b_lead_screw_lead");
+
+        optgroup = page->new_optgroup(L("UV curing"), L"param_special");
+        optgroup->append_single_option_line("diw_uv_on_gcode");
+        optgroup->append_single_option_line("diw_uv_off_gcode");
+        optgroup->append_single_option_line("diw_uv_offset_y");
+
+        optgroup = page->new_optgroup(L("Nozzle wiper"), L"param_position");
+        optgroup->append_single_option_line("diw_wiper_x_start");
+        optgroup->append_single_option_line("diw_wiper_x_end");
+        optgroup->append_single_option_line("diw_wiper_y");
+        optgroup->append_single_option_line("diw_wiper_z");
+        optgroup->append_single_option_line("diw_wiper_speed");
+        optgroup->append_single_option_line("diw_wiper_z_hop");
+        optgroup->append_single_option_line("diw_wiper_z_min");
+
+        optgroup = page->new_optgroup(L("u-MEX powder head"), L"param_infill");
+        optgroup->append_single_option_line("diw_powder_pin");
+        optgroup->append_single_option_line("diw_powder_nozzle_diameter");
+        optgroup->append_single_option_line("diw_powder_offset_x");
+        optgroup->append_single_option_line("diw_powder_offset_y");
+        optgroup->append_single_option_line("diw_powder_offset_z");
+        optgroup->append_single_option_line("diw_powder_motor_voltage");
+        optgroup->append_single_option_line("diw_powder_speed_max");
+        optgroup->append_single_option_line("diw_powder_lag_on");
+        optgroup->append_single_option_line("diw_powder_lag_off");
+
+        optgroup = page->new_optgroup(L("Bed compaction"), L"param_special");
+        optgroup->append_single_option_line("diw_compaction_pin");
+        optgroup->append_single_option_line("diw_compaction_z_hop");
+        optgroup->append_single_option_line("diw_compaction_settle_time");
 
     page = add_options_page(L("Notes"), "custom-gcode_note"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Notes"), "note", 0);
@@ -6752,6 +6844,22 @@ void TabPrinter::toggle_options()
     //if (m_active_page->title() == "Custom G-code") {
     //    toggle_option("change_filament_gcode", have_multiple_extruders);
     //}
+    if (m_active_page->title() == L("DIW / u-MEX")) {
+        // Everything on this page except the master switch is greyed out for non-DIW printers.
+        const bool is_diw = m_config->opt_bool("diw_printer");
+        for (const char *key : { "diw_syringe_diameter", "diw_b_drivetrain_units", "diw_b_gear_ratio", "diw_b_lead_screw_lead",
+                                 "diw_uv_on_gcode", "diw_uv_off_gcode", "diw_uv_offset_y",
+                                 "diw_wiper_x_start", "diw_wiper_x_end", "diw_wiper_y", "diw_wiper_z", "diw_wiper_speed",
+                                 "diw_wiper_z_hop", "diw_wiper_z_min",
+                                 "diw_powder_pin", "diw_powder_nozzle_diameter", "diw_powder_offset_x", "diw_powder_offset_y",
+                                 "diw_powder_offset_z", "diw_powder_motor_voltage", "diw_powder_speed_max",
+                                 "diw_powder_lag_on", "diw_powder_lag_off",
+                                 "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time" })
+            toggle_option(key, is_diw);
+        // The B gear ratio and lead only matter when B is written in motor revolutions.
+        toggle_option("diw_b_gear_ratio", is_diw && m_config->opt_bool("diw_b_drivetrain_units"));
+        toggle_option("diw_b_lead_screw_lead", is_diw && m_config->opt_bool("diw_b_drivetrain_units"));
+    }
     if (m_active_page->title() == L("Basic information")) {
         const auto &printer_cfg = m_preset_bundle->printers.get_edited_preset().config;
 

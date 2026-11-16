@@ -1519,6 +1519,10 @@ static std::vector<std::string> s_Preset_print_options{
     "zaa_dont_alternate_fill_direction",
     "zaa_min_z",
     "ironing_expansion",
+    // DIW / u-MEX
+    "diw_auger_stop_dwell", "diw_powder_infill", "diw_powder_hatch_spacing", "diw_powder_hatch_angle",
+    "diw_shell_powder_clearance", "diw_powder_min_area", "diw_powder_overflow_policy", "diw_powder_point_dwell_length",
+    "diw_powder_z_clearance", "diw_powder_travel_hop", "diw_compaction_time", "diw_compaction_interval",
 };
 
 static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", */ "default_filament_colour", "required_nozzle_HRC", "filament_diameter", "pellet_flow_coefficient", "volumetric_speed_coefficients", "filament_type",
@@ -1583,7 +1587,11 @@ static std::vector<std::string> s_Preset_filament_options {/*"filament_colour", 
     //ams chamber
     "filament_dev_ams_drying_ams_limitations", "filament_dev_ams_drying_temperature", "filament_dev_ams_drying_time", "filament_dev_ams_drying_heat_distortion_temperature",
     "filament_dev_chamber_drying_bed_temperature", "filament_dev_chamber_drying_time",
-    "filament_dev_drying_softening_temperature", "filament_dev_drying_cooling_temperature"
+    "filament_dev_drying_softening_temperature", "filament_dev_drying_cooling_temperature",
+    // DIW / u-MEX
+    "diw_a_axis_mode", "diw_k_screw", "diw_b_multiplier", "diw_retraction_enable", "diw_retraction_max_length",
+    "diw_retraction_max_speed", "diw_post_extrusion_dwell", "diw_uv_layer_dwell", "diw_uv_end_dwell",
+    "diw_powder_mass_flow", "diw_powder_apparent_density", "diw_powder_tap_density", "diw_powder_fill_multiplier"
     };
 
 static std::vector<std::string> s_Preset_machine_limits_options {
@@ -1642,7 +1650,14 @@ static std::vector<std::string> s_Preset_printer_options {
     // Fast-purge printer flag + device/firmware-facing per-variant extruder-change
     // deretraction speed (unconsumed by the slicer; carried by H2D/A2L/X2D/P2S machine profiles).
     "support_fast_purge_mode", "deretract_speed_extruder_change",
-    "printer_plugin_config_overrides"
+    "printer_plugin_config_overrides",
+    // DIW / u-MEX
+    "diw_printer", "diw_syringe_diameter", "diw_b_drivetrain_units", "diw_b_gear_ratio", "diw_b_lead_screw_lead",
+    "diw_uv_on_gcode", "diw_uv_off_gcode", "diw_uv_offset_y",
+    "diw_wiper_x_start", "diw_wiper_x_end", "diw_wiper_y", "diw_wiper_z", "diw_wiper_speed", "diw_wiper_z_hop", "diw_wiper_z_min",
+    "diw_powder_pin", "diw_powder_nozzle_diameter", "diw_powder_offset_x", "diw_powder_offset_y", "diw_powder_offset_z",
+    "diw_powder_motor_voltage", "diw_powder_speed_max", "diw_powder_lag_on", "diw_powder_lag_off",
+    "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time"
     };
 
 static std::vector<std::string> s_Preset_sla_print_options {

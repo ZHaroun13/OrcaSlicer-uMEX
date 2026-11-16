@@ -61,8 +61,22 @@ enum GCodeFlavor : unsigned char {
     gcfSailfish, 
     gcfMach3, 
     gcfMachinekit,
-    gcfSmoothie, 
+    gcfSmoothie,
     gcfNoExtrusion
+};
+
+// DIW / u-MEX: how the printhead auger (A axis) is commanded while paste is extruded.
+enum DIWAxisAMode : int {
+    diwaFlowScaled = 0,   // A = (dE/ds) * F * K_screw
+    diwaProportional,     // A = F * K_screw
+    diwaCumulative        // A += ds * K_screw
+};
+
+// DIW / u-MEX: what to do when the powder traverse feed needed for the target mass exceeds the limit.
+enum DIWPowderOverflow : int {
+    diwpoIncreaseSpacing = 0,
+    diwpoClamp,
+    diwpoError
 };
 
 // How a filament is used across the model. Part of the multi-nozzle grouping data; not yet
@@ -797,6 +811,8 @@ extern std::vector<std::string> save_extruder_nozzle_stats_to_string(const std::
 
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PrinterTechnology)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(GCodeFlavor)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(DIWAxisAMode)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(DIWPowderOverflow)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FuzzySkinMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(TopSurfaceExpansionDirection)
@@ -1952,10 +1968,72 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloats,   filament_dev_drying_cooling_temperature))
 )
 
+// DIW / u-MEX settings. A class of their own: GCodeConfig and PrintConfig are at the
+// Boost.Preprocessor sequence limit (256), so adding keys there breaks the build.
+PRINT_CONFIG_CLASS_DEFINE(
+    DIWConfig,
+
+    // printer preset
+    ((ConfigOptionBool,                diw_printer))
+    ((ConfigOptionFloat,               diw_syringe_diameter))
+    ((ConfigOptionBool,                diw_b_drivetrain_units))
+    ((ConfigOptionFloat,               diw_b_gear_ratio))
+    ((ConfigOptionFloat,               diw_b_lead_screw_lead))
+    ((ConfigOptionString,              diw_uv_on_gcode))
+    ((ConfigOptionString,              diw_uv_off_gcode))
+    ((ConfigOptionFloat,               diw_uv_offset_y))
+    ((ConfigOptionFloat,               diw_wiper_x_start))
+    ((ConfigOptionFloat,               diw_wiper_x_end))
+    ((ConfigOptionFloat,               diw_wiper_y))
+    ((ConfigOptionFloat,               diw_wiper_z))
+    ((ConfigOptionFloat,               diw_wiper_speed))
+    ((ConfigOptionFloat,               diw_wiper_z_hop))
+    ((ConfigOptionFloat,               diw_wiper_z_min))
+    ((ConfigOptionInt,                 diw_powder_pin))
+    ((ConfigOptionFloat,               diw_powder_nozzle_diameter))
+    ((ConfigOptionFloat,               diw_powder_offset_x))
+    ((ConfigOptionFloat,               diw_powder_offset_y))
+    ((ConfigOptionFloat,               diw_powder_offset_z))
+    ((ConfigOptionFloat,               diw_powder_motor_voltage))
+    ((ConfigOptionFloat,               diw_powder_speed_max))
+    ((ConfigOptionFloat,               diw_powder_lag_on))
+    ((ConfigOptionFloat,               diw_powder_lag_off))
+    ((ConfigOptionInt,                 diw_compaction_pin))
+    ((ConfigOptionFloat,               diw_compaction_z_hop))
+    ((ConfigOptionFloat,               diw_compaction_settle_time))
+    // DIW / u-MEX material settings (filament preset, one value per filament)
+    ((ConfigOptionEnumsGeneric,        diw_a_axis_mode))
+    ((ConfigOptionFloats,              diw_k_screw))
+    ((ConfigOptionFloats,              diw_b_multiplier))
+    ((ConfigOptionBools,               diw_retraction_enable))
+    ((ConfigOptionFloats,              diw_retraction_max_length))
+    ((ConfigOptionFloats,              diw_retraction_max_speed))
+    ((ConfigOptionFloats,              diw_post_extrusion_dwell))
+    ((ConfigOptionFloats,              diw_uv_layer_dwell))
+    ((ConfigOptionFloats,              diw_uv_end_dwell))
+    ((ConfigOptionFloats,              diw_powder_mass_flow))
+    ((ConfigOptionFloats,              diw_powder_apparent_density))
+    ((ConfigOptionFloats,              diw_powder_tap_density))
+    ((ConfigOptionFloats,              diw_powder_fill_multiplier))
+    // process preset
+    ((ConfigOptionFloat,               diw_auger_stop_dwell))
+    ((ConfigOptionBool,                diw_powder_infill))
+    ((ConfigOptionFloat,               diw_powder_hatch_spacing))
+    ((ConfigOptionFloat,               diw_powder_hatch_angle))
+    ((ConfigOptionFloat,               diw_shell_powder_clearance))
+    ((ConfigOptionFloat,               diw_powder_min_area))
+    ((ConfigOptionEnum<DIWPowderOverflow>, diw_powder_overflow_policy))
+    ((ConfigOptionFloat,               diw_powder_point_dwell_length))
+    ((ConfigOptionFloat,               diw_powder_z_clearance))
+    ((ConfigOptionFloat,               diw_powder_travel_hop))
+    ((ConfigOptionFloat,               diw_compaction_time))
+    ((ConfigOptionInt,                 diw_compaction_interval))
+)
+
 // This object is mapped to Perl as Slic3r::Config::Print.
 PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     PrintConfig,
-    (MachineEnvelopeConfig, GCodeConfig),
+    (MachineEnvelopeConfig, GCodeConfig, DIWConfig),
 
     // Build plate tilt for off-axis gravity support generation (printer-level setting).
     ((ConfigOptionFloat,               build_plate_tilt_x))

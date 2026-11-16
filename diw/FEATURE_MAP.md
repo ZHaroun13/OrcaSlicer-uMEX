@@ -79,7 +79,11 @@ Paths below are relative to `src/`.
 
 Each milestone is checked against the v2 post-processor output (step 4, golden tests) before the next one starts.
 
-1. **Settings only**: new flavor + all keys + GUI pages + presets. Slicing output unchanged.
+1. **Settings only** (done): 52 `diw_*` keys (27 printer, 13 filament, 12 process) in a new `DIWConfig`
+   class (GCodeConfig and PrintConfig are at the Boost.PP 256-entry limit), a "DIW / u-MEX" page
+   in each settings tab, and the `diw_printer` master switch that shows or greys out the rest. Slicing
+   output is unchanged; the keys only add lines to the G-code config block. The PlanetCNC flavor moved to
+   milestone 2, where its writer behaviour is defined.
 2. **Paste writer**: B/A axes, PlanetCNC dialect, dwells, retraction guard, DIW-hostile features forced off. Must match v2 **paste-only** output (motion + B/A within rounding).
 3. **Layer sequence**: UV, final cure, wipe and compaction as fixed sequences. Must match v2 paste-only output with UV.
 4. **Powder core**: `erPowder`, cavity offset, hatching, feed and I/O, nozzle offset. Must match v2 **powder** output on the test cube, and remove the `seam_gap 0%` requirement.

@@ -1155,6 +1155,20 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     
     toggle_line("ironing_speed", has_ironing || has_support_ironing, -1, _L("Enable ironing or support ironing to edit ironing speed."));
 
+    // DIW / u-MEX: process settings only apply to DIW printers; powder settings need powder infill on.
+    {
+        const bool is_diw_printer = preset_bundle->printers.get_edited_preset().config.opt_bool("diw_printer");
+        // Per-object setting configs do not carry print-level keys, hence the has() guard.
+        const bool has_powder     = is_diw_printer && config->has("diw_powder_infill") && config->opt_bool("diw_powder_infill");
+        const wxString diw_reason = _L("Enable \"DIW / u-MEX machine\" in the printer settings to use this setting.");
+        for (auto el : { "diw_auger_stop_dwell", "diw_powder_infill" })
+            toggle_line(el, is_diw_printer, -1, diw_reason);
+        for (auto el : { "diw_powder_hatch_spacing", "diw_powder_hatch_angle", "diw_shell_powder_clearance", "diw_powder_min_area",
+                         "diw_powder_overflow_policy", "diw_powder_point_dwell_length", "diw_powder_z_clearance",
+                         "diw_powder_travel_hop", "diw_compaction_time", "diw_compaction_interval" })
+            toggle_line(el, has_powder, -1, is_diw_printer ? _L("Enable u-MEX powder infill to use this setting.") : diw_reason);
+    }
+
     bool has_zaa = config->opt_bool("zaa_enabled");
     for (auto el : {"zaa_minimize_perimeter_height", "zaa_min_z", "zaa_dont_alternate_fill_direction", "ironing_expansion"})
         toggle_line(el, has_zaa, -1, _L("Enable Z contouring to use this setting."));

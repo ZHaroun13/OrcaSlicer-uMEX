@@ -238,6 +238,20 @@ static t_config_enum_values s_keys_map_GCodeFlavor {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(GCodeFlavor)
 
+static t_config_enum_values s_keys_map_DIWAxisAMode {
+    { "flow_scaled",    diwaFlowScaled },
+    { "proportional",   diwaProportional },
+    { "cumulative",     diwaCumulative }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(DIWAxisAMode)
+
+static t_config_enum_values s_keys_map_DIWPowderOverflow {
+    { "increase_spacing", diwpoIncreaseSpacing },
+    { "clamp",            diwpoClamp },
+    { "error",            diwpoError }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(DIWPowderOverflow)
+
 static t_config_enum_values s_keys_map_BedTempFormula {
     { "by_first_filament",int(BedTempFormula::btfFirstFilament) },
     { "by_highest_temp", int(BedTempFormula::btfHighestTemp)}
@@ -8987,6 +9001,232 @@ void PrintConfigDef::init_fff_params()
                      "Otherwise, the rectilinear pattern will be used by default.");
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionBool(true));
+
+    // ---------------------------------------------------------------------------------------------
+    // DIW / u-MEX (direct ink writing with optional micro-material-extrusion powder infill).
+    // Milestone 1: settings only. No option below changes the generated G-code yet.
+    // Defaults are those of the v2 post-processor (diw_engine.py 2.0.0); feeds are in mm/s here.
+    // ---------------------------------------------------------------------------------------------
+    auto diw_def = [this](const char *key, ConfigOptionType type, const char *label, const char *tooltip,
+                          const char *sidetext = "") {
+        ConfigOptionDef *d = this->add(key, type);
+        d->label    = label;
+        d->category = L("DIW / u-MEX");
+        d->tooltip  = tooltip;
+        d->sidetext = sidetext;
+        d->mode     = comAdvanced;
+        return d;
+    };
+
+    // ---- printer ----
+    def = diw_def("diw_printer", coBool, L("DIW / u-MEX machine"),
+                  L("This printer extrudes paste with a syringe pump (B axis) and a printhead auger (A axis) "
+                    "instead of filament, and can add u-MEX powder infill. Enables the DIW settings."));
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = diw_def("diw_syringe_diameter", coFloat, L("Syringe inner diameter"),
+                  L("Inner bore diameter of the paste syringe. The B axis moves by the paste volume each move "
+                    "requires divided by the bore area."), L("mm"));
+    def->min = 1;
+    def->set_default_value(new ConfigOptionFloat(50.));
+
+    def = diw_def("diw_b_drivetrain_units", coBool, L("Output B in motor revolutions"),
+                  L("If enabled, B is converted from plunger travel to motor revolutions with the gear ratio and "
+                    "lead screw lead below. If disabled, B is the plunger travel in mm."));
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = diw_def("diw_b_gear_ratio", coFloat, L("B gear ratio (driven / driver)"),
+                  L("Gear reduction between the B motor and the lead screw."));
+    def->min = 0.001;
+    def->set_default_value(new ConfigOptionFloat(7.5));
+
+    def = diw_def("diw_b_lead_screw_lead", coFloat, L("B lead screw lead"),
+                  L("Plunger travel per lead screw revolution (pitch x number of starts)."), L("mm/rev"));
+    def->min = 0.001;
+    def->set_default_value(new ConfigOptionFloat(4.));
+
+    def = diw_def("diw_uv_on_gcode", coString, L("UV on command"), L("Command that switches the UV curing lamp on."));
+    def->set_default_value(new ConfigOptionString("M62 P3 Q1"));
+
+    def = diw_def("diw_uv_off_gcode", coString, L("UV off command"), L("Command that switches the UV curing lamp off."));
+    def->set_default_value(new ConfigOptionString("M62 P3 Q0"));
+
+    def = diw_def("diw_uv_offset_y", coFloat, L("UV lamp offset Y"),
+                  L("Y distance from the paste nozzle to the centre of the UV dome. For curing, the head moves so "
+                    "that the dome is over the layer's bounding-box centre."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(112.538));
+
+    def = diw_def("diw_wiper_x_start", coFloat, L("Wiper start X"), L("X where the nozzle wipe starts."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(13.));
+    def = diw_def("diw_wiper_x_end", coFloat, L("Wiper end X"), L("X where the nozzle wipe ends."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(48.));
+    def = diw_def("diw_wiper_y", coFloat, L("Wiper Y"), L("Y of the wiper blade."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(198.));
+    def = diw_def("diw_wiper_z", coFloat, L("Wiper Z"), L("Nozzle Z while wiping."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(0.5));
+    def = diw_def("diw_wiper_speed", coFloat, L("Wipe speed"), L("Speed of the wipe stroke."), L("mm/s"));
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(50.));
+    def = diw_def("diw_wiper_z_hop", coFloat, L("Wiper lift"),
+                  L("Lift above the current Z before travelling to the wiper."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(3.));
+    def = diw_def("diw_wiper_z_min", coFloat, L("Wiper minimum travel Z"),
+                  L("The travel to the wiper is never lower than this absolute Z."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(5.));
+
+    def = diw_def("diw_powder_pin", coInt, L("Powder feeder output"), L("M62 digital output number of the powder feeder."));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionInt(5));
+    def = diw_def("diw_powder_nozzle_diameter", coFloat, L("Powder nozzle diameter"), L("Outlet diameter of the powder nozzle."), L("mm"));
+    def->min = 0.01;
+    def->set_default_value(new ConfigOptionFloat(0.8));
+    def = diw_def("diw_powder_offset_x", coFloat, L("Powder nozzle offset X"),
+                  L("X position of the powder nozzle relative to the paste nozzle. Not calibrated while all three offsets are 0."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_powder_offset_y", coFloat, L("Powder nozzle offset Y"),
+                  L("Y position of the powder nozzle relative to the paste nozzle."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_powder_offset_z", coFloat, L("Powder nozzle offset Z"),
+                  L("Height of the powder nozzle tip above the paste nozzle tip."), L("mm"));
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_powder_motor_voltage", coFloat, L("Powder motor voltage"),
+                  L("Feeder motor voltage. The powder mass flow is only valid at the voltage it was calibrated at."), L("V"));
+    def->min = 3.65;
+    def->max = 12.;
+    def->set_default_value(new ConfigOptionFloat(3.65));
+    def = diw_def("diw_powder_speed_max", coFloat, L("Maximum powder traverse speed"),
+                  L("Upper limit of the powder hatching speed. See the overflow policy in the process settings."), L("mm/s"));
+    def->min = 0.1;
+    def->set_default_value(new ConfigOptionFloat(50.));
+    def = diw_def("diw_powder_lag_on", coFloat, L("Powder start lag"),
+                  L("Time between switching the feeder on and powder leaving the nozzle."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.15));
+    def = diw_def("diw_powder_lag_off", coFloat, L("Powder stop lag"),
+                  L("Time powder keeps flowing after the feeder is switched off."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.15));
+
+    def = diw_def("diw_compaction_pin", coInt, L("Compaction table output"), L("M62 digital output number of the vibration table."));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionInt(6));
+    def = diw_def("diw_compaction_z_hop", coFloat, L("Compaction lift"), L("Nozzle lift while the bed vibrates."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(2.));
+    def = diw_def("diw_compaction_settle_time", coFloat, L("Compaction settle time"), L("Wait after the vibration stops."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    // ---- filament (paste + powder material) ----
+    def = diw_def("diw_a_axis_mode", coEnums, L("Auger (A axis) mode"),
+                  L("How the printhead auger is commanded: speed scaled by flow, speed proportional to feed, "
+                    "or cumulative position."));
+    def->enum_keys_map = &ConfigOptionEnum<DIWAxisAMode>::get_enum_values();
+    def->enum_values  = { "flow_scaled", "proportional", "cumulative" };
+    def->enum_labels  = { L("Flow-scaled speed"), L("Proportional speed"), L("Cumulative position") };
+    def->set_default_value(new ConfigOptionEnumsGeneric{ (int)diwaFlowScaled });
+
+    def = diw_def("diw_k_screw", coFloats, L("Auger constant K"), L("Scaling constant of the auger command."));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 3.48 });
+    def = diw_def("diw_b_multiplier", coFloats, L("Syringe flow multiplier"),
+                  L("Correction factor applied to every B move (steady-state volumetric flow)."));
+    def->min = 0.01;
+    def->max = 5.;
+    def->set_default_value(new ConfigOptionFloats{ 1. });
+    def = diw_def("diw_retraction_enable", coBools, L("Allow syringe retraction"),
+                  L("If disabled, retraction moves are not sent to the syringe."));
+    def->set_default_value(new ConfigOptionBools{ true });
+    def = diw_def("diw_retraction_max_length", coFloats, L("Maximum syringe retraction"),
+                  L("Retractions longer than this are blocked."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 5. });
+    def = diw_def("diw_retraction_max_speed", coFloats, L("Maximum syringe retraction speed"),
+                  L("Retraction speed limit for the syringe."), L("mm/s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 5. });
+    def = diw_def("diw_post_extrusion_dwell", coFloats, L("Post-extrusion dwell"),
+                  L("Dwell when extrusion ends and travel starts, to let the paste pressure relax."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 0. });
+    def = diw_def("diw_uv_layer_dwell", coFloats, L("UV cure time per layer"),
+                  L("UV exposure after each layer and after the last layer. 0 disables layer curing."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 5. });
+    def = diw_def("diw_uv_end_dwell", coFloats, L("Final UV cure time"), L("Extra UV exposure at the end of the print."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloats{ 0. });
+    def = diw_def("diw_powder_mass_flow", coFloats, L("Powder mass flow"),
+                  L("Feeder mass flow at the calibration voltage."), L("g/min"));
+    def->min = 0.001;
+    def->set_default_value(new ConfigOptionFloats{ 6.24 });
+    def = diw_def("diw_powder_apparent_density", coFloats, L("Powder apparent density"),
+                  L("Loose (poured) density. Used for the Hausner ratio report."), L("g/cm³"));
+    def->min = 0.001;
+    def->set_default_value(new ConfigOptionFloats{ 1.60 });
+    def = diw_def("diw_powder_tap_density", coFloats, L("Powder tap density"),
+                  L("Density after compaction. Sets the powder mass each layer needs."), L("g/cm³"));
+    def->min = 0.001;
+    def->set_default_value(new ConfigOptionFloats{ 1.95 });
+    def = diw_def("diw_powder_fill_multiplier", coFloats, L("Powder fill multiplier"),
+                  L("Correction factor on the powder mass delivered per layer."));
+    def->min = 0.01;
+    def->set_default_value(new ConfigOptionFloats{ 1. });
+
+    // ---- process ----
+    def = diw_def("diw_auger_stop_dwell", coFloat, L("Auger stop dwell"),
+                  L("Pressure-relief dwell after the paste contour of a powder layer, used when the filament's "
+                    "post-extrusion dwell is 0."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.2));
+    def = diw_def("diw_powder_infill", coBool, L("u-MEX powder infill"),
+                  L("Replace the sparse infill of core layers with dispensed powder: paste walls, wipe, UV cure, "
+                    "powder hatching, then compaction."));
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionBool(false));
+    def = diw_def("diw_powder_hatch_spacing", coFloat, L("Powder hatch spacing"), L("Distance between powder hatch lines."), L("mm"));
+    def->min = 0.01;
+    def->set_default_value(new ConfigOptionFloat(1.2));
+    def = diw_def("diw_powder_hatch_angle", coFloat, L("Powder hatch angle"), L("Direction of the powder hatch lines. 0 is parallel to X."), L("°"));
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_shell_powder_clearance", coFloat, L("Shell to powder clearance"),
+                  L("Distance between the inner paste wall and the powder hatch."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.85));
+    def = diw_def("diw_powder_min_area", coFloat, L("Minimum powder region"),
+                  L("Cavity regions smaller than this keep the normal paste infill."), L("mm²"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(2.));
+    def = diw_def("diw_powder_overflow_policy", coEnum, L("Powder speed overflow"),
+                  L("What to do when the speed needed for the target powder mass is above the maximum: widen the "
+                    "hatch spacing to keep the mass exact, clamp the speed (over-delivers powder), or stop with an error."));
+    def->enum_keys_map = &ConfigOptionEnum<DIWPowderOverflow>::get_enum_values();
+    def->enum_values  = { "increase_spacing", "clamp", "error" };
+    def->enum_labels  = { L("Increase spacing"), L("Clamp speed"), L("Error") };
+    def->set_default_value(new ConfigOptionEnum<DIWPowderOverflow>(diwpoIncreaseSpacing));
+    def = diw_def("diw_powder_point_dwell_length", coFloat, L("Point-dispense length"),
+                  L("Hatch lines shorter than this are dispensed as a stationary dwell."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(5.));
+    def = diw_def("diw_powder_z_clearance", coFloat, L("Powder nozzle height above layer"),
+                  L("Height of the powder nozzle tip above the top of the layer while dispensing."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_powder_travel_hop", coFloat, L("Powder travel lift"),
+                  L("Lift of the lowest nozzle tip above the layer during powder travels."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(2.));
+    def = diw_def("diw_compaction_time", coFloat, L("Compaction time"),
+                  L("Vibration time per compaction. Limited to 8 s to avoid size segregation of the powder."), L("s"));
+    def->min = 0.1;
+    def->max = 8.;
+    def->set_default_value(new ConfigOptionFloat(3.));
+    def = diw_def("diw_compaction_interval", coInt, L("Compaction interval"),
+                  L("Compact after every N powder layers. The last powder layer is always compacted."), L("layers"));
+    def->min = 1;
+    def->set_default_value(new ConfigOptionInt(1));
 }
 
 void PrintConfigDef::init_extruder_option_keys()
@@ -12690,7 +12930,7 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
 #define PRINT_CONFIG_CACHE_ELEMENT_INITIALIZATION(r, data, CLASS_NAME) Slic3r::CLASS_NAME::initialize_cache();
 #define PRINT_CONFIG_CACHE_INITIALIZE(CLASSES_SEQ)     BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_CACHE_ELEMENT_DEFINITION, _, BOOST_PP_TUPLE_TO_SEQ(CLASSES_SEQ))     int print_config_static_initializer() {         /* For some reason it's important this function doesn't get optimized out, so this should work. */         static volatile int ret = 1;         BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_CACHE_ELEMENT_INITIALIZATION, _, BOOST_PP_TUPLE_TO_SEQ(CLASSES_SEQ))         return ret;     }
 PRINT_CONFIG_CACHE_INITIALIZE((
-    PrintObjectConfig, PrintRegionConfig, MachineEnvelopeConfig, GCodeConfig, PrintConfig, FullPrintConfig,
+    PrintObjectConfig, PrintRegionConfig, MachineEnvelopeConfig, GCodeConfig, DIWConfig, PrintConfig, FullPrintConfig,
     SLAMaterialConfig, SLAPrintConfig, SLAPrintObjectConfig, SLAPrinterConfig, SLAFullPrintConfig))
 static int print_config_static_initialized = print_config_static_initializer();
 
@@ -12705,7 +12945,7 @@ static int print_config_static_initialized = print_config_static_initializer();
         visit_option_pairs(*dst, *this, [](const char*, ConfigOption &a, const ConfigOption &b) { a.set(&b); return true; }); \
         return true; \
     }
-BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_APPLY_TO_DEFINITION, _, (PrintObjectConfig)(PrintRegionConfig)(MachineEnvelopeConfig)(GCodeConfig)
+BOOST_PP_SEQ_FOR_EACH(PRINT_CONFIG_APPLY_TO_DEFINITION, _, (PrintObjectConfig)(PrintRegionConfig)(MachineEnvelopeConfig)(GCodeConfig)(DIWConfig)
     (SLAMaterialConfig)(SLAPrintConfig)(SLAPrintObjectConfig)(SLAPrinterConfig))
 #undef PRINT_CONFIG_APPLY_TO_DEFINITION
 
