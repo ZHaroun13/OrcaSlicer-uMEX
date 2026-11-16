@@ -24,7 +24,7 @@ Paths below are relative to `src/`.
 | v2 | Orca location | Notes |
 |---|---|---|
 | New machine dialect (PlanetCNC TNG) | `enum GCodeFlavor` (`libslic3r/PrintConfig.hpp` 52) | Add `gfPlanetCNC`. Gates every behaviour below so other printers are untouched. |
-| `calculate_delta_b`: ΔB = ΔE·(d_f/D_syringe)²·multiplier (optional drivetrain conversion) | `libslic3r/GCodeWriter.hpp` `emit_e` (362) and its callers `extrude_to_xy` (`GCodeWriter.cpp` 1303), the arc/xyz variants, `retract` (1464) | Native: compute B straight from extrusion **volume** (mm³ / syringe area) instead of a virtual 1.75 mm filament. `filament_diameter` then stops mattering. |
+| `calculate_delta_b`: ΔB = ΔE·(d_f/D_syringe)²·multiplier (optional drivetrain conversion) | `libslic3r/GCodeWriter.hpp` `emit_e` (362) and its callers `extrude_to_xy` (`GCodeWriter.cpp` 1303), the arc/xyz variants, `retract` (1464) | **Decided:** B is computed from the extrusion **volume** required (ΔB = V / A_syringe, then multiplier and optional drivetrain conversion), not from a virtual 1.75 mm filament. `filament_diameter` stops mattering. |
 | A-axis auger modes (flow-scaled speed, proportional speed, cumulative position) + `A0.000` at extrusion end | `GCodeFormatter` (`GCodeWriter.hpp`, `emit_axis`), `GCodeWriter::extrude_to_xy` / `travel_to_xyz` (980) | Add an `emit_a`. "Speed" modes need A written on every extruding move and `A0` on the first travel. |
 | Retraction guard (`max_retract_de_mm`, `max_retract_feedrate`) | `GCodeWriter::retract` (1464) / `unretract` + `Print::validate` | Clamp or reject in validation rather than silently dropping moves at output. |
 | Strip `G28`, `M84`; dwell in seconds `G04 P<s>`; no temperature or fan codes | `GCodeWriter::set_temperature`, `set_fan` (1559), dwell helpers; start/end G-code placeholders | Flavor-specific. |
@@ -34,10 +34,10 @@ Paths below are relative to `src/`.
 
 | v2 | Orca location | Notes |
 |---|---|---|
-| Inter-layer UV macro: move to layer bounding-box centre + `uv_offset_y_mm`, `M62 P3 Q1`, `G04`, `M62 P3 Q0`, return | `GCode::process_layer_change_gcode` (`GCode.cpp` 6123) and the `before_layer_change_gcode` sites (6239, 6710) | Best as new **custom G-code templates** (`uv_cure_gcode`, etc.) with placeholders such as `[layer_bbox_center_x]`. That way the user can edit the macros in the GUI. |
+| Inter-layer UV macro: move to layer bounding-box centre + `uv_offset_y_mm`, `M62 P3 Q1`, `G04`, `M62 P3 Q0`, return | `GCode::process_layer_change_gcode` (`GCode.cpp` 6123) and the `before_layer_change_gcode` sites (6239, 6710) | **Decided: fixed sequence** generated in C++ (not a user-editable template). Only its parameters (UV pin commands, offset, dwell) come from settings. |
 | Final UV cure (once, before end G-code) | `GCode::_do_export` (3419), just before `machine_end_gcode` (4860–4890) | |
-| Stage 2 nozzle wipe (`wiper_*`) | new template in the per-layer sequence | |
-| Stage 5 vibration compaction (`M62 P6`, duration, settle, Z hop, interval) | new template in the per-layer sequence | Interval and "last core layer always compacts" need a placeholder like `[is_last_core_layer]`. |
+| Stage 2 nozzle wipe (`wiper_*`) | fixed sequence in the per-layer code | Parameters from printer settings. |
+| Stage 5 vibration compaction (`M62 P6`, duration, settle, Z hop, interval) | fixed sequence in the per-layer code | Interval and "last core layer always compacts" are decided in C++ from the layer's surface types. |
 | 6-stage order (paste walls → auger stop + dwell → wipe → UV → powder → compaction → advance) | `GCode::process_layer` (6603) | Emit paste extrusions first, then the templates, then the powder paths, then compaction. This is the main change to Orca's layer loop. |
 
 ### D. u-MEX powder core
@@ -51,7 +51,7 @@ Paths below are relative to `src/`.
 | New path role for powder | `enum ExtrusionRole` (`libslic3r/ExtrusionEntity.hpp` 26–48) | Add `erPowder`: written with **no E/B/A**, `;TYPE:Powder`, own colour in preview. |
 | `resolve_powder_feed`: F_powder from mass flow, tap density, spacing, layer height; overflow policy | `GCode::_extrude` (`GCode.cpp` 9245) for `erPowder` | Feed overrides the speed settings. Policy "increase spacing" must feed back into hatch generation, so compute it in the fill step. |
 | Feeder `M62 P5 Q1/Q0` with lag-on/off compensation, point-dwell for short hatches | `GCode::_extrude` / a powder-specific `extrude_powder()` | |
-| Powder nozzle offset X/Y/Z, dispensing Z, safe transit Z | Orca's `extruder_offset` mechanism in `GCodeWriter` + Z handling in `travel_to_xyz` | Treat the powder nozzle as a second "tool" offset. |
+| Powder nozzle offset X/Y/Z, dispensing Z, safe transit Z | `GCodeWriter` (applied to powder paths only) + Z handling in `travel_to_xyz` | **Decided:** the powder nozzle is an **offset tool on the main extruder**, not a second Orca extruder. Offset X/Y/Z are printer settings the user enters in the slicer (defaults 0, with a warning while uncalibrated). |
 | Soft limits check/clamp | `Print::validate` + travel generation | Orca's bed shape (`printable_area`) already covers part of this. |
 
 ### E. Preview, time estimate, statistics
@@ -81,12 +81,14 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
 
 1. **Settings only**: new flavor + all keys + GUI pages + presets. Slicing output unchanged.
 2. **Paste writer**: B/A axes, PlanetCNC dialect, dwells, retraction guard, DIW-hostile features forced off. Must match v2 **paste-only** output (motion + B/A within rounding).
-3. **Layer sequence**: UV, final cure, wipe and compaction as templates. Must match v2 paste-only output with UV.
+3. **Layer sequence**: UV, final cure, wipe and compaction as fixed sequences. Must match v2 paste-only output with UV.
 4. **Powder core**: `erPowder`, cavity offset, hatching, feed and I/O, nozzle offset. Must match v2 **powder** output on the test cube, and remove the `seam_gap 0%` requirement.
 5. **Preview + validation + time**.
 
-## 4. Open decisions
+## 4. Decisions (16 Nov 2026)
 
-- B from volume vs. keep virtual filament (affects compatibility with existing calibrations).
-- Templates (user-editable G-code) vs. hard-coded sequences for UV, wipe and compaction.
-- Powder nozzle as a real second extruder (Orca multi-tool) vs. an offset on one tool.
+- **B axis:** computed from the paste volume each move requires, divided by the syringe bore area. No virtual filament. Existing `b_multiplier` calibrations still apply as a correction factor.
+- **UV curing, nozzle wipe, compaction:** fixed sequences in C++, configured only through their parameters.
+- **Powder nozzle:** an offset tool attached to the main extruder. The X/Y/Z offset is entered later in the slicer's printer settings.
+
+Milestone 2 should check that B from volume equals v2's virtual-filament B within rounding. The two are mathematically the same when `filament_diameter` matches.
