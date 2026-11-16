@@ -2089,6 +2089,22 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     if (extruders.empty())
         return { L("No extrusions under current settings.") };
 
+    // DIW / u-MEX: Print::apply() forces these off globally; a per-object or per-part setting can bring them back.
+    if (m_config.diw_printer.value) {
+        for (const PrintObject *object : m_objects)
+            for (const PrintRegion &region : object->all_regions()) {
+                const PrintRegionConfig &rc = region.config();
+                if (rc.seam_gap.value > 0.)
+                    return { L("DIW / u-MEX machines need a seam gap of 0: an open wall seam leaks paste and leaves the "
+                               "powder cavity open. Set \"Seam gap\" to 0 in this object's settings."),
+                             object, "seam_gap" };
+                if (rc.wipe_on_loops.value || rc.wipe_before_external_loop.value)
+                    return { L("DIW / u-MEX machines cannot wipe on loops: the nozzle would drag through fresh paste. "
+                               "Turn off \"Wipe on loops\" and \"Wipe before external loop\" in this object's settings."),
+                             object, "wipe_on_loops" };
+            }
+    }
+
     // A flow ratio of 0 would extrude nothing, and a nil one would write NaN extrusion lengths.
     {
         const std::vector<double> &flow_ratios = m_config.filament_flow_ratio.values;

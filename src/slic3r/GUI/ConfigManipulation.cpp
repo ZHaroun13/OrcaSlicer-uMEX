@@ -1157,7 +1157,13 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     // DIW / u-MEX: process settings only apply to DIW printers; powder settings need powder infill on.
     {
-        const bool is_diw_printer = preset_bundle->printers.get_edited_preset().config.opt_bool("diw_printer");
+        // The PlanetCNC TNG flavor also makes the printer a DIW machine (see Print::apply()).
+        const bool is_diw_printer = preset_bundle->printers.get_edited_preset().config.opt_bool("diw_printer") ||
+                                    gcflavor == GCodeFlavor::gcfPlanetCNC;
+        // Settings Print::apply() forces off for DIW machines are shown greyed out.
+        if (is_diw_printer)
+            for (auto el : { "seam_gap", "wipe_on_loops", "wipe_before_external_loop", "enable_arc_fitting" })
+                toggle_field(el, false, -1, _L("Forced off for DIW / u-MEX machines: paste extrusion needs closed seams, no wipes and straight segments."));
         // Per-object setting configs do not carry print-level keys, hence the has() guard.
         const bool has_powder     = is_diw_printer && config->has("diw_powder_infill") && config->opt_bool("diw_powder_infill");
         const wxString diw_reason = _L("Enable \"DIW / u-MEX machine\" in the printer settings to use this setting.");

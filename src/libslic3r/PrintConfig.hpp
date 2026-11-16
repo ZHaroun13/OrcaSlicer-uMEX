@@ -54,8 +54,15 @@ enum GCodeFlavor : unsigned char {
     gcfKlipper, 
     gcfRepRapFirmware, 
     gcfRepetier, 
-    gcfMarlinFirmware, 
-    gcfRepRapSprinter, 
+    gcfMarlinFirmware,
+    // DIW / u-MEX on a PlanetCNC TNG controller. Never reaches the G-code generator: Print::apply()
+    // replaces it by gcfMarlinLegacy and turns diw_printer on, and the DIW translation writes the
+    // PlanetCNC dialect at export (see GCode/DIWTranslator.hpp).
+    // It must directly follow the flavors shown in the GUI: the settings combo box stores the position
+    // of the selected item as the enum value (GUI.cpp change_opt_value), so the listed flavors have to be
+    // 0, 1, 2, ... in list order. Files store flavors by name, so the values of the ones below may shift.
+    gcfPlanetCNC,
+    gcfRepRapSprinter,
     gcfTeacup, 
     gcfMakerWare, 
     gcfSailfish, 

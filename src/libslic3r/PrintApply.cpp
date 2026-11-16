@@ -1346,6 +1346,38 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
         set_compensation(extruders.front());
 }
 
+// DIW / u-MEX (diw/FEATURE_MAP.md, milestone 2).
+// - The PlanetCNC TNG G-code flavor stands for a DIW / u-MEX machine: the slicer writes Marlin (legacy)
+//   G-code, which the DIW translation (GCode/DIWTranslator) turns into PlanetCNC G-code at export. So the
+//   flavor is replaced by Marlin (legacy) here and the DIW switch is turned on.
+// - On a DIW machine the FDM features that break paste extrusion are forced off. They are set here, before
+//   the config is compared with the previous one, so the result is stable and is what the G-code config
+//   block reports. Per-object overrides of the region settings are rejected by Print::validate().
+static void apply_diw_overrides(DynamicPrintConfig &cfg)
+{
+    if (auto *flavor = cfg.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor"); flavor && flavor->value == gcfPlanetCNC) {
+        flavor->value = gcfMarlinLegacy;
+        cfg.set_key_value("diw_printer", new ConfigOptionBool(true));
+    }
+    const auto *diw = cfg.option<ConfigOptionBool>("diw_printer");
+    if (diw == nullptr || ! diw->value)
+        return;
+    // Values already off are left as they are, so a correct preset is reported unchanged.
+    // An open seam leaks paste at the loop ends and leaves the u-MEX powder cavity open.
+    if (auto *o = cfg.option<ConfigOptionFloatOrPercent>("seam_gap"); o && o->value != 0.)
+        o->value = 0.;
+    // Wipes drag the nozzle through fresh paste.
+    for (const char *key : { "wipe_on_loops", "wipe_before_external_loop" })
+        if (auto *o = cfg.option<ConfigOptionBool>(key))
+            o->value = false;
+    // Arcs: the auger command and the powder planner work on straight segments.
+    if (auto *o = cfg.option<ConfigOptionEnum<ArcFittingMode>>("enable_arc_fitting"))
+        o->value = ArcFittingMode::Disabled;
+    // Slowing small layers down changes the paste flow calibration.
+    if (auto *o = cfg.option<ConfigOptionBools>("slow_down_for_layer_cooling"))
+        for (auto &v : o->values) v = false;
+}
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config, bool extruder_applied)
 {
 #ifdef _DEBUG
@@ -1398,6 +1430,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             new_full_config.set_key_value("build_plate_tilt_y", new ConfigOptionFloat(tilt.tilt_y_deg));
         }
     }
+    apply_diw_overrides(new_full_config);
     const ConfigOption* enable_support_option = new_full_config.option("enable_support");
     if (enable_support_option && enable_support_option->getBool())
         m_support_used = true;

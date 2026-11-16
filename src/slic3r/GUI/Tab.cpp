@@ -5250,6 +5250,15 @@ void TabFilament::toggle_options()
         bool has_slow_down_for_layer_cooling = m_config->opt_bool("slow_down_for_layer_cooling", 0);
         toggle_option("dont_slow_down_outer_wall", has_slow_down_for_layer_cooling, -1, _L("Enable slowing down for layer cooling to use this setting."));
 
+        // DIW / u-MEX: Print::apply() forces the layer-cooling slow-down off (it changes the paste flow calibration).
+        {
+            const DynamicPrintConfig &diw_printer_cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
+            if (diw_printer_cfg.opt_bool("diw_printer") ||
+                diw_printer_cfg.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value == gcfPlanetCNC)
+                for (const char *key : { "slow_down_for_layer_cooling", "dont_slow_down_outer_wall" })
+                    toggle_option(key, false, -1, _L("Forced off for DIW / u-MEX machines: slowing layers down changes the paste flow calibration."));
+        }
+
         // ORCA: First layer fan speed override only makes sense when no layers are gated off ("No cooling for
         // the first" == 0). Otherwise the override would set layer 0 to a non-zero value while the gate forces
         // layers 1..N-1 to zero, producing a confusing non-monotonic profile. When the gate is active we both
@@ -5338,7 +5347,8 @@ void TabFilament::toggle_options()
         toggle_line("filament_diameter", !is_pellet_printer, -1, _L("Filament diameter is unavailable for pellet printers."));
 
         // DIW / u-MEX material settings only apply to printers marked as DIW machines.
-        const bool is_diw_printer = printer_cfg.opt_bool("diw_printer");
+        const bool is_diw_printer = printer_cfg.opt_bool("diw_printer") ||
+                                    printer_cfg.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value == gcfPlanetCNC;
         for (const char *key : { "diw_a_axis_mode", "diw_k_screw", "diw_b_multiplier", "diw_post_extrusion_dwell",
                                  "diw_retraction_enable", "diw_retraction_max_length", "diw_retraction_max_speed",
                                  "diw_uv_layer_dwell", "diw_uv_end_dwell", "diw_powder_mass_flow",
@@ -6846,7 +6856,10 @@ void TabPrinter::toggle_options()
     //}
     if (m_active_page->title() == L("DIW / u-MEX")) {
         // Everything on this page except the master switch is greyed out for non-DIW printers.
-        const bool is_diw = m_config->opt_bool("diw_printer");
+        // The PlanetCNC TNG flavor makes the printer a DIW machine by itself (see Print::apply()).
+        const bool is_planetcnc = m_config->option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor")->value == gcfPlanetCNC;
+        const bool is_diw       = m_config->opt_bool("diw_printer") || is_planetcnc;
+        toggle_option("diw_printer", ! is_planetcnc, -1, _L("Always on with the PlanetCNC TNG G-code flavor."));
         for (const char *key : { "diw_syringe_diameter", "diw_b_drivetrain_units", "diw_b_gear_ratio", "diw_b_lead_screw_lead",
                                  "diw_uv_on_gcode", "diw_uv_off_gcode", "diw_uv_offset_y",
                                  "diw_wiper_x_start", "diw_wiper_x_end", "diw_wiper_y", "diw_wiper_z", "diw_wiper_speed",

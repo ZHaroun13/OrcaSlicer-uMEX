@@ -879,7 +879,8 @@ std::string Translator::run(const std::vector<std::string> &raw_lines)
 bool diw_translation_enabled(const DynamicPrintConfig &config)
 {
     const auto *o = config.option<ConfigOptionBool>("diw_printer");
-    return o != nullptr && o->value;
+    const auto *f = config.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor");
+    return (o != nullptr && o->value) || (f != nullptr && f->value == gcfPlanetCNC);
 }
 
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config)

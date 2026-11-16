@@ -234,7 +234,8 @@ static t_config_enum_values s_keys_map_GCodeFlavor {
     { "smoothie",       gcfSmoothie },
     { "mach3",          gcfMach3 },
     { "machinekit",     gcfMachinekit },
-    { "no-extrusion",   gcfNoExtrusion }
+    { "no-extrusion",   gcfNoExtrusion },
+    { "planetcnc",      gcfPlanetCNC }
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(GCodeFlavor)
 
@@ -4658,6 +4659,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_values.push_back("reprapfirmware");
     def->enum_values.push_back("repetier");
     def->enum_values.push_back("marlin2");
+    def->enum_values.push_back("planetcnc");
     //def->enum_values.push_back("reprap");
     //def->enum_values.push_back("teacup");
     //def->enum_values.push_back("makerware");
@@ -4671,6 +4673,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels.push_back("RepRapFirmware");
     def->enum_labels.push_back("Repetier");
     def->enum_labels.push_back("Marlin 2");
+    def->enum_labels.push_back(L("PlanetCNC TNG (DIW / u-MEX)"));
     //def->enum_labels.push_back("RepRap/Sprinter");
     //def->enum_labels.push_back("Teacup");
     //def->enum_labels.push_back("MakerWare (MakerBot)");

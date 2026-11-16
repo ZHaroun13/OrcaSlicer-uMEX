@@ -102,8 +102,17 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
      start/end blocks, layer-marker variants) plus real Orca output, under 3 settings variants. 42/42
      identical on 16 Nov 2026. Known approximation: Python's Unicode `\w` is reproduced exactly for
      ASCII and Latin-1 and by block ranges elsewhere.
-   - Still to do here: a native PlanetCNC flavor, and forcing DIW-hostile Orca features off (seam gap,
-     arc fitting, layer cooling slow-down) instead of relying on the presets.
+   - **PlanetCNC TNG flavor** (`gcfPlanetCNC`, "planetcnc"): choosing it makes the printer a DIW machine.
+     `Print::apply()` replaces it with Marlin (legacy), so the slicer core writes the G-code the translator
+     expects and no Marlin check elsewhere needs a PlanetCNC case, and turns `diw_printer` on. The G-code
+     config block therefore reports `gcode_flavor = marlin` and `diw_printer = 1`. The enum value sits
+     right after Marlin 2 because the GUI combo stores the list position as the enum value.
+   - **DIW-hostile features forced off** in `Print::apply()` when `diw_printer` is on: seam gap → 0,
+     wipe on loops and wipe before external loop → off, arc fitting → disabled, slow down for layer
+     cooling → off. Values already off are left untouched. The GUI greys them out with the reason.
+     Per-object seam gap or wipe overrides are rejected by `Print::validate()`.
+   - Test: PlanetCNC flavor with all of these turned on gives the same G-code as the clean DIW preset
+     (1939 lines, 0 differences).
 3. **Layer sequence**: nozzle wipe and compaction as fixed sequences (UV is done in milestone 2).
 4. **Powder core**: `erPowder`, cavity offset, hatching, feed and I/O, nozzle offset. Must match v2 **powder** output on the test cube, and remove the `seam_gap 0%` requirement.
 5. **Preview + validation + time**.
