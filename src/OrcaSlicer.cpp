@@ -145,6 +145,7 @@
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Exception.hpp"
 #include "libslic3r/GCode/GCodeProcessor.hpp"
+#include "libslic3r/GCode/DIWTranslator.hpp"
 #include "libslic3r/GCode/GCodeStatistics.hpp"
 #include "libslic3r/GCode/ToolOrdering.hpp"
 #include "libslic3r/ObjectID.hpp"
@@ -7196,6 +7197,9 @@ int CLI::run(int argc, char **argv)
                                     BOOST_LOG_TRIVIAL(info) << "process finished, will export gcode temporarily to " << outfile << std::endl;
                                     temp_time = (long long)Slic3r::Utils::get_current_time_utc();
                                     outfile = print_fff->export_gcode(outfile, gcode_result, nullptr);
+                                    // DIW / u-MEX: the CLI runs no post-processing scripts, but the machine translation is built in.
+                                    if (diw_translation_enabled(print_fff->full_print_config()))
+                                        diw_translate_gcode_file(outfile, print_fff->full_print_config());
                                     time_using_cache = time_using_cache + ((long long)Slic3r::Utils::get_current_time_utc() - temp_time);
                                     BOOST_LOG_TRIVIAL(info) << "export_gcode finished: time_using_cache update to " << time_using_cache << " secs.";
                                     if (gcode_result && gcode_result->gcode_check_result.error_code) {

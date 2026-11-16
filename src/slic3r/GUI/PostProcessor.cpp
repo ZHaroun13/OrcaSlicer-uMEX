@@ -8,6 +8,8 @@
 // Post-processing plugins are executed through the embedded-Python plugin system, which is why this
 // file lives in the GUI layer (libslic3r must not depend on pybind11 / PluginManager).
 #include "libslic3r/Config.hpp"
+#include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/GCode/DIWTranslator.hpp"
 #include "slic3r/plugin/PluginManager.hpp"
 #include "slic3r/plugin/pluginTypes/slicingPipeline/SlicingPipelinePluginCapability.hpp"
 #include "slic3r/plugin/PythonInterpreter.hpp"
@@ -355,7 +357,11 @@ static bool run_post_process_scripts_impl(
     const auto* slicing_pipeline_plugin = config.opt<ConfigOptionStrings>("slicing_pipeline_plugin");
     const bool  have_scripts            = post_process != nullptr && !post_process->values.empty();
     const bool  have_plugins            = slicing_pipeline_plugin != nullptr && !slicing_pipeline_plugin->values.empty();
-    if (!have_scripts && !have_plugins)
+    // DIW / u-MEX: the exported G-code is translated for the PlanetCNC machine before any user script runs.
+    // It works on the same working copy, so the G-code viewer keeps the untranslated file.
+    const DynamicPrintConfig *print_config = &config;
+    const bool  have_diw                = diw_translation_enabled(config);
+    if (!have_scripts && !have_plugins && !have_diw)
         return false;
 
     std::string path;
@@ -422,6 +428,10 @@ static bool run_post_process_scripts_impl(
     remove_output_name_file();
 
     try {
+        if (have_diw) {
+            BOOST_LOG_TRIVIAL(info) << "DIW / u-MEX translation of " << path;
+            diw_translate_gcode_file(path, *print_config); // a failure is handled by the catch below
+        }
         if (have_scripts) {
             for (const std::string& scripts : post_process->values) {
                 std::vector<std::string> lines;

@@ -84,8 +84,21 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
    in each settings tab, and the `diw_printer` master switch that shows or greys out the rest. Slicing
    output is unchanged; the keys only add lines to the G-code config block. The PlanetCNC flavor moved to
    milestone 2, where its writer behaviour is defined.
-2. **Paste writer**: B/A axes, PlanetCNC dialect, dwells, retraction guard, DIW-hostile features forced off. Must match v2 **paste-only** output (motion + B/A within rounding).
-3. **Layer sequence**: UV, final cure, wipe and compaction as fixed sequences. Must match v2 paste-only output with UV.
+2. **Paste translation** (done): `libslic3r/GCode/DIWTranslator.{hpp,cpp}`, a line-for-line C++ port of the
+   v2 paste path. It covers E → B (by volume) + A (3 auger modes), the PlanetCNC rules (FDM commands commented
+   out, `[ ]` → `( )` in comments, G28/M84/empty G4 removed, retraction limits) and the UV sequences that
+   belong to the paste path (start-up self-check, inter-layer cure, final cure, end-of-print cure), so
+   that part of milestone 3 is done too.
+   - Runs on the **exported file** when `diw_printer` is on: GUI through `run_post_process_scripts()`
+     (before user scripts, on the working copy), CLI right after `export_gcode()`. The preview keeps the
+     FDM moves. A file that already starts with the translation header is not translated twice.
+   - Remove `DIW_Orca_post_processor_v2.exe` from the process preset's post-processing scripts when
+     `diw_printer` is on, or the start-up UV self-check is added twice.
+   - Golden test (16 Nov 2026, 25 mm cube): identical to v2 line for line (only the header line differs)
+     for the defaults and for the Alginate, Ceramic and Silver presets and a B-in-revolutions / no-UV case.
+   - Still to do here: a native PlanetCNC flavor, and forcing DIW-hostile Orca features off (seam gap,
+     arc fitting, layer cooling slow-down) instead of relying on the presets.
+3. **Layer sequence**: nozzle wipe and compaction as fixed sequences (UV is done in milestone 2).
 4. **Powder core**: `erPowder`, cavity offset, hatching, feed and I/O, nozzle offset. Must match v2 **powder** output on the test cube, and remove the `seam_gap 0%` requirement.
 5. **Preview + validation + time**.
 
@@ -94,5 +107,10 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
 - **B axis:** computed from the paste volume each move requires, divided by the syringe bore area. No virtual filament. Existing `b_multiplier` calibrations still apply as a correction factor.
 - **UV curing, nozzle wipe, compaction:** fixed sequences in C++, configured only through their parameters.
 - **Powder nozzle:** an offset tool attached to the main extruder. The X/Y/Z offset is entered later in the slicer's printer settings.
+- **Where the paste translation runs (milestone 2):** on the exported file, not inside `GCodeWriter`. This keeps
+  the preview, time estimate and G-code viewer working on the FDM moves, and lets the v2 output serve as
+  an exact golden reference. B is still the paste volume divided by the syringe bore area. Moving the
+  B/A words into `GCodeWriter` itself can come with milestone 5 (preview), when the G-code viewer learns
+  the A/B axes.
 
 Milestone 2 should check that B from volume equals v2's virtual-filament B within rounding. The two are mathematically the same when `filament_diameter` matches.
