@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -28,14 +29,107 @@ const char *DIW_TRANSLATION_HEADER = "; DIW / u-MEX translation by OrcaSlicer-uM
 namespace {
 
 // ------------------------------------------------------------------------------------------------
-// Text helpers (Python str semantics on ASCII)
+// Text helpers with Python str semantics. The text is valid UTF-8 (see sanitize_utf8()); whitespace
+// and word characters are judged per code point, as Python's str methods and Unicode regexes do.
 // ------------------------------------------------------------------------------------------------
 
-inline bool is_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
 inline bool is_digit(char c) { return c >= '0' && c <= '9'; }
-// Python's \w: letters, digits, underscore; bytes of multi-byte UTF-8 characters count as letters.
-inline bool is_word(char c) { return std::isalnum((unsigned char) c) || c == '_' || (unsigned char) c >= 0x80; }
 inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
+inline bool is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+// Code point starting at s[i]; *len receives its length in bytes.
+uint32_t decode_at(const std::string &s, size_t i, size_t *len)
+{
+    const unsigned char c = (unsigned char) s[i];
+    size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
+    if (i + n > s.size()) n = 1;
+    uint32_t cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
+    for (size_t k = 1; k < n; ++k)
+        cp = (cp << 6) | ((unsigned char) s[i + k] & 0x3F);
+    if (len) *len = n;
+    return cp;
+}
+
+// Start of the code point that ends just before s[i] (i > 0).
+size_t prev_start(const std::string &s, size_t i)
+{
+    size_t k = i - 1;
+    while (k > 0 && is_cont((unsigned char) s[k])) --k;
+    return k;
+}
+
+// Python str.isspace(): ASCII \t \n \v \f \r, \x1c-\x1f, space, and the Unicode spaces.
+bool is_space_cp(uint32_t c)
+{
+    return c == ' ' || (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x1F) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+// Python's \w (str.isalnum() or '_'). Exact for ASCII and Latin-1; elsewhere letters and digits of all
+// scripts count as word characters and the main punctuation / symbol blocks do not.
+bool is_word_cp(uint32_t c)
+{
+    if (c < 0x80)
+        return std::isalnum((int) c) || c == '_';
+    if (c <= 0xBF) // Latin-1 punctuation and symbols; ª ² ³ µ ¹ º ¼ ½ ¾ are letters or numbers
+        return c == 0xAA || c == 0xB2 || c == 0xB3 || c == 0xB5 || c == 0xB9 || c == 0xBA || c == 0xBC || c == 0xBD || c == 0xBE;
+    if (c == 0xD7 || c == 0xF7) // × ÷
+        return false;
+    if (is_space_cp(c))
+        return false;
+    if ((c >= 0x2000 && c <= 0x206F) ||  // general punctuation
+        (c >= 0x20A0 && c <= 0x20CF) ||  // currency symbols
+        (c >= 0x2190 && c <= 0x245F) ||  // arrows, mathematical operators, technical symbols
+        (c >= 0x2500 && c <= 0x2BFF) ||  // box drawing, shapes, dingbats, misc symbols and arrows
+        (c >= 0x3000 && c <= 0x3004) || (c >= 0x3008 && c <= 0x3020) || // CJK punctuation
+        (c >= 0xFE30 && c <= 0xFE4F) || (c >= 0xFF01 && c <= 0xFF0F) || c == 0xFFFD)
+        return false;
+    return true;
+}
+
+// Byte length of the whitespace code point at s[i], 0 if s[i] does not start one.
+size_t space_len_at(const std::string &s, size_t i)
+{
+    size_t n;
+    return is_space_cp(decode_at(s, i, &n)) ? n : 0;
+}
+
+bool space_at(const std::string &s, size_t i) { return i < s.size() && space_len_at(s, i) > 0; }
+bool word_at(const std::string &s, size_t i) { return i < s.size() && is_word_cp(decode_at(s, i, nullptr)); }
+bool word_before(const std::string &s, size_t i) { return i > 0 && is_word_cp(decode_at(s, prev_start(s, i), nullptr)); }
+
+// errors="replace" decoding: every maximal invalid UTF-8 subpart becomes U+FFFD, as Python reads the file.
+std::string sanitize_utf8(const std::string &s)
+{
+    static const char FFFD[] = "\xEF\xBF\xBD";
+    std::string r;
+    r.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        const unsigned char b = (unsigned char) s[i];
+        if (b < 0x80) { r += char(b); ++i; continue; }
+        size_t need; unsigned char lo = 0x80, hi = 0xBF;
+        if (b >= 0xC2 && b <= 0xDF) need = 1;
+        else if (b == 0xE0) { need = 2; lo = 0xA0; }
+        else if ((b >= 0xE1 && b <= 0xEC) || b == 0xEE || b == 0xEF) need = 2;
+        else if (b == 0xED) { need = 2; hi = 0x9F; }
+        else if (b == 0xF0) { need = 3; lo = 0x90; }
+        else if (b >= 0xF1 && b <= 0xF3) need = 3;
+        else if (b == 0xF4) { need = 3; hi = 0x8F; }
+        else { r += FFFD; ++i; continue; }
+        size_t j = i + 1;
+        bool ok = true;
+        for (size_t k = 0; k < need; ++k, ++j) {
+            const unsigned char c = j < s.size() ? (unsigned char) s[j] : 0;
+            const unsigned char l = k == 0 ? lo : 0x80, h = k == 0 ? hi : 0xBF;
+            if (j >= s.size() || c < l || c > h) { ok = false; break; }
+        }
+        if (ok) r.append(s, i, j - i);
+        else    r += FFFD;
+        i = j;
+    }
+    return r;
+}
 
 std::string to_lower(const std::string &s)
 {
@@ -55,15 +149,19 @@ std::string to_upper(const std::string &s)
 std::string strip(const std::string &s)
 {
     size_t b = 0, e = s.size();
-    while (b < e && is_space(s[b])) ++b;
-    while (e > b && is_space(s[e - 1])) --e;
+    for (size_t n; b < e && (n = space_len_at(s, b)) > 0;) b += n;
+    while (e > b) {
+        const size_t p = prev_start(s, e);
+        if (p < b || space_len_at(s, p) == 0) break;
+        e = p;
+    }
     return s.substr(b, e - b);
 }
 
 std::string lstrip(const std::string &s)
 {
     size_t b = 0;
-    while (b < s.size() && is_space(s[b])) ++b;
+    for (size_t n; b < s.size() && (n = space_len_at(s, b)) > 0;) b += n;
     return s.substr(b);
 }
 
@@ -77,9 +175,9 @@ std::string collapse_ws(const std::string &s)
     std::string r;
     size_t i = 0;
     while (i < s.size()) {
-        while (i < s.size() && is_space(s[i])) ++i;
+        for (size_t n; i < s.size() && (n = space_len_at(s, i)) > 0;) i += n;
         size_t b = i;
-        while (i < s.size() && ! is_space(s[i])) ++i;
+        while (i < s.size() && ! space_at(s, i)) ++i;
         if (i > b) {
             if (! r.empty()) r += ' ';
             r.append(s, b, i - b);
@@ -91,15 +189,20 @@ std::string collapse_ws(const std::string &s)
 std::string first_token(const std::string &code)
 {
     size_t i = 0;
-    while (i < code.size() && ! is_space(code[i])) ++i;
+    while (i < code.size() && ! space_at(code, i)) ++i;
     return to_upper(code.substr(0, i));
 }
 
+// Python f"{v:.Nf}": any length, and "nan" / "inf" / "-inf" for non-finite values.
 std::string format_num(const char *f, double v)
 {
-    char buf[64];
-    snprintf(buf, sizeof(buf), f, v);
-    return buf;
+    if (std::isnan(v)) return "nan";
+    if (std::isinf(v)) return v < 0 ? "-inf" : "inf";
+    const int n = snprintf(nullptr, 0, f, v);
+    std::string r(size_t(std::max(n, 0)), '\0');
+    if (n > 0)
+        snprintf(&r[0], size_t(n) + 1, f, v);
+    return r;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -144,7 +247,7 @@ WordMatch find_word(const std::string &s, const char *letters, size_t from = 0)
         bool hit = false;
         for (const char *l = letters; *l; ++l)
             if (c == *l || c == lower(*l)) { hit = true; break; }
-        if (! hit || (i > 0 && is_word(s[i - 1])))
+        if (! hit || word_before(s, i))
             continue;
         const size_t e = match_number(s, i + 1);
         if (e == std::string::npos)
@@ -186,12 +289,16 @@ bool is_layer_marker(const std::string &line)
     for (size_t p = s.find(lc); p != std::string::npos; p = s.find(lc, p + 1)) {
         const bool after_before = p >= 7 && s.compare(p - 7, 7, "before_") == 0;
         const size_t q = p + lc.size();
-        if (! after_before && (q >= s.size() || ! is_word(s[q])))
+        if (! after_before && ! word_at(s, q))
             return true;
     }
     for (size_t p = s.find("layer"); p != std::string::npos; p = s.find("layer", p + 1)) {
         size_t q = p + 5;
-        while (q < s.size() && (is_space(s[q]) || s[q] == '_' || s[q] == ':')) ++q;
+        for (size_t n; q < s.size();) {
+            if ((n = space_len_at(s, q)) > 0) q += n;
+            else if (s[q] == '_' || s[q] == ':') ++q;
+            else break;
+        }
         if (q < s.size() && is_digit(s[q]))
             return true;
     }
@@ -205,11 +312,11 @@ bool has_semicolon_phrase(const std::string &line, const char *w1, bool need_spa
     const size_t l1 = strlen(w1), l2 = strlen(w2);
     for (size_t p = s.find(';'); p != std::string::npos; p = s.find(';', p + 1)) {
         size_t q = p + 1;
-        while (q < s.size() && is_space(s[q])) ++q;
+        for (size_t n; q < s.size() && (n = space_len_at(s, q)) > 0;) q += n;
         if (s.compare(q, l1, w1) != 0) continue;
         q += l1;
         const size_t q0 = q;
-        while (q < s.size() && is_space(s[q])) ++q;
+        for (size_t n; q < s.size() && (n = space_len_at(s, q)) > 0;) q += n;
         if (need_space && q == q0) continue;
         if (s.compare(q, l2, w2) == 0) return true;
     }
@@ -227,8 +334,8 @@ size_t skip_line_number(const std::string &s)
     if (! s.empty() && (s[0] == 'N' || s[0] == 'n')) {
         size_t k = 1;
         while (k < s.size() && is_digit(s[k])) ++k;
-        if (k > 1 && k < s.size() && is_space(s[k])) {
-            while (k < s.size() && is_space(s[k])) ++k;
+        if (k > 1 && space_at(s, k)) {
+            for (size_t n; k < s.size() && (n = space_len_at(s, k)) > 0;) k += n;
             return k;
         }
     }
@@ -243,7 +350,7 @@ bool starts_with_command(const std::string &s, const char *cmd)
         bool ok = s.size() >= k + n;
         for (size_t i = 0; ok && i < n; ++i)
             ok = lower(s[k + i]) == lower(cmd[i]);
-        if (ok && (k + n >= s.size() || ! is_word(s[k + n])))
+        if (ok && ! word_at(s, k + n))
             return true;
     }
     return false;
@@ -261,7 +368,7 @@ bool is_motion(const std::string &s)
                 if (q >= s.size() || s[q] != '0') continue;
                 ++q;
             }
-            if (q < s.size() && s[q] >= '0' && s[q] <= '3' && (q + 1 >= s.size() || ! is_word(s[q + 1])))
+            if (q < s.size() && s[q] >= '0' && s[q] <= '3' && ! word_at(s, q + 1))
                 return true;
         }
     }
@@ -777,21 +884,24 @@ bool diw_translation_enabled(const DynamicPrintConfig &config)
 
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config)
 {
-    // Lines keep their '\n' (Python readlines()); "\r\n" is read as "\n".
+    // Read as Python does: UTF-8 with errors="replace", universal newlines ("\n", "\r\n" and a lone "\r"
+    // all end a line and become "\n"), lines keep their '\n' (readlines()).
+    const std::string text = sanitize_utf8(gcode);
     std::vector<std::string> lines;
-    size_t pos = 0;
-    while (pos < gcode.size()) {
-        size_t e = gcode.find('\n', pos);
-        std::string l = gcode.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
-        if (! l.empty() && l.back() == '\r')
-            l.pop_back();
-        if (e != std::string::npos)
-            l += '\n';
-        lines.push_back(std::move(l));
-        if (e == std::string::npos)
-            break;
-        pos = e + 1;
+    std::string cur;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '\r' || c == '\n') {
+            if (c == '\r' && i + 1 < text.size() && text[i + 1] == '\n')
+                ++i;
+            cur += '\n';
+            lines.push_back(std::move(cur));
+            cur.clear();
+        } else
+            cur += c;
     }
+    if (! cur.empty())
+        lines.push_back(std::move(cur));
     if (! lines.empty() && starts_with(lines.front(), DIW_TRANSLATION_HEADER))
         return gcode; // already translated
 

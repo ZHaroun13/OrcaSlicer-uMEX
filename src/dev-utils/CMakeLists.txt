@@ -34,6 +34,11 @@ if (ORCA_TOOLS)
     target_link_libraries(texture_unwrap_dump libslic3r boost_headeronly nanosvg)
     target_compile_definitions(texture_unwrap_dump PRIVATE ${_DEV_DEFS})
 
+    # diw_translate: runs the DIW / u-MEX G-code translation on an existing file (regression tests, diw/tests).
+    add_executable(diw_translate diw_translate.cpp)
+    target_link_libraries(diw_translate libslic3r boost_headeronly)
+    target_compile_definitions(diw_translate PRIVATE ${_DEV_DEFS})
+
     # profile_include_dump: prints what included templates contribute to a vendor's presets,
     # to diff against the same tool built in BambuStudio. Built only on request.
     add_executable(profile_include_dump EXCLUDE_FROM_ALL profile_include_dump.cpp)

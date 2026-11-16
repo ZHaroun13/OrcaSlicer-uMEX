@@ -96,6 +96,12 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
      `diw_printer` is on, or the start-up UV self-check is added twice.
    - Golden test (16 Nov 2026, 25 mm cube): identical to v2 line for line (only the header line differs)
      for the defaults and for the Alginate, Ceramic and Silver presets and a B-in-revolutions / no-UV case.
+   - Regression test: `diw/tests/compare_v2.py` runs `diw_translate.exe` (dev tool, built with
+     ORCA_TOOLS; run it from `build/src/Release` so it finds the DLLs) and v2 on 12 edge cases (Unicode
+     symbols and spaces, invalid UTF-8, lone CR, overflow to inf/NaN, huge numbers, M83, arcs, N numbers,
+     start/end blocks, layer-marker variants) plus real Orca output, under 3 settings variants. 42/42
+     identical on 16 Nov 2026. Known approximation: Python's Unicode `\w` is reproduced exactly for
+     ASCII and Latin-1 and by block ranges elsewhere.
    - Still to do here: a native PlanetCNC flavor, and forcing DIW-hostile Orca features off (seam gap,
      arc fitting, layer cooling slow-down) instead of relying on the presets.
 3. **Layer sequence**: nozzle wipe and compaction as fixed sequences (UV is done in milestone 2).
