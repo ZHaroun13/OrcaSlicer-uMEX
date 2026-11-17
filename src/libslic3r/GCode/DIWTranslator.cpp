@@ -1,6 +1,8 @@
 #include "DIWTranslator.hpp"
 #include "DIWPyCompat.hpp"
 #include "DIWUMexParams.hpp"
+#include "DIWUMexSequencer.hpp"
+#include "DIWPowderBlock.hpp"
 
 #include "../Exception.hpp"
 #include "../LocalesUtils.hpp"
@@ -32,74 +34,22 @@ const char *DIW_TRANSLATION_HEADER = "; DIW / u-MEX translation by OrcaSlicer-uM
 namespace {
 
 // ------------------------------------------------------------------------------------------------
-// Text helpers with Python str semantics. The text is valid UTF-8 (see sanitize_utf8()); whitespace
-// and word characters are judged per code point, as Python's str methods and Unicode regexes do.
+// Text helpers with Python str semantics (GCode/DIWPyCompat, shared with the u-MEX sequencer). The text is
+// valid UTF-8 (see sanitize_utf8()).
 // ------------------------------------------------------------------------------------------------
 
-inline bool is_digit(char c) { return c >= '0' && c <= '9'; }
-inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? char(c - 'A' + 'a') : c; }
-inline bool is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
-
-// Code point starting at s[i]; *len receives its length in bytes.
-uint32_t decode_at(const std::string &s, size_t i, size_t *len)
-{
-    const unsigned char c = (unsigned char) s[i];
-    size_t n = c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4;
-    if (i + n > s.size()) n = 1;
-    uint32_t cp = n == 1 ? c : n == 2 ? (c & 0x1F) : n == 3 ? (c & 0x0F) : (c & 0x07);
-    for (size_t k = 1; k < n; ++k)
-        cp = (cp << 6) | ((unsigned char) s[i + k] & 0x3F);
-    if (len) *len = n;
-    return cp;
-}
-
-// Start of the code point that ends just before s[i] (i > 0).
-size_t prev_start(const std::string &s, size_t i)
-{
-    size_t k = i - 1;
-    while (k > 0 && is_cont((unsigned char) s[k])) --k;
-    return k;
-}
-
-// Python str.isspace(): ASCII \t \n \v \f \r, \x1c-\x1f, space, and the Unicode spaces.
-bool is_space_cp(uint32_t c)
-{
-    return c == ' ' || (c >= 0x09 && c <= 0x0D) || (c >= 0x1C && c <= 0x1F) || c == 0x85 || c == 0xA0 || c == 0x1680 ||
-           (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
-}
-
-// Python's \w (str.isalnum() or '_'). Exact for ASCII and Latin-1; elsewhere letters and digits of all
-// scripts count as word characters and the main punctuation / symbol blocks do not.
-bool is_word_cp(uint32_t c)
-{
-    if (c < 0x80)
-        return std::isalnum((int) c) || c == '_';
-    if (c <= 0xBF) // Latin-1 punctuation and symbols; ª ² ³ µ ¹ º ¼ ½ ¾ are letters or numbers
-        return c == 0xAA || c == 0xB2 || c == 0xB3 || c == 0xB5 || c == 0xB9 || c == 0xBA || c == 0xBC || c == 0xBD || c == 0xBE;
-    if (c == 0xD7 || c == 0xF7) // × ÷
-        return false;
-    if (is_space_cp(c))
-        return false;
-    if ((c >= 0x2000 && c <= 0x206F) ||  // general punctuation
-        (c >= 0x20A0 && c <= 0x20CF) ||  // currency symbols
-        (c >= 0x2190 && c <= 0x245F) ||  // arrows, mathematical operators, technical symbols
-        (c >= 0x2500 && c <= 0x2BFF) ||  // box drawing, shapes, dingbats, misc symbols and arrows
-        (c >= 0x3000 && c <= 0x3004) || (c >= 0x3008 && c <= 0x3020) || // CJK punctuation
-        (c >= 0xFE30 && c <= 0xFE4F) || (c >= 0xFF01 && c <= 0xFF0F) || c == 0xFFFD)
-        return false;
-    return true;
-}
-
-// Byte length of the whitespace code point at s[i], 0 if s[i] does not start one.
-size_t space_len_at(const std::string &s, size_t i)
-{
-    size_t n;
-    return is_space_cp(decode_at(s, i, &n)) ? n : 0;
-}
-
-bool space_at(const std::string &s, size_t i) { return i < s.size() && space_len_at(s, i) > 0; }
-bool word_at(const std::string &s, size_t i) { return i < s.size() && is_word_cp(decode_at(s, i, nullptr)); }
-bool word_before(const std::string &s, size_t i) { return i > 0 && is_word_cp(decode_at(s, prev_start(s, i), nullptr)); }
+using DIW::is_digit;
+using DIW::lower;
+using DIW::space_len_at;
+using DIW::space_at;
+using DIW::word_at;
+using DIW::to_lower;
+using DIW::to_upper;
+using DIW::strip;
+using DIW::lstrip;
+using DIW::WordMatch;
+using DIW::find_word;
+using DIW::replace_words;
 
 // errors="replace" decoding: every maximal invalid UTF-8 subpart becomes U+FFFD, as Python reads the file.
 std::string sanitize_utf8(const std::string &s)
@@ -132,40 +82,6 @@ std::string sanitize_utf8(const std::string &s)
         i = j;
     }
     return r;
-}
-
-std::string to_lower(const std::string &s)
-{
-    std::string r(s);
-    for (char &c : r) c = lower(c);
-    return r;
-}
-
-std::string to_upper(const std::string &s)
-{
-    std::string r(s);
-    for (char &c : r)
-        if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
-    return r;
-}
-
-std::string strip(const std::string &s)
-{
-    size_t b = 0, e = s.size();
-    for (size_t n; b < e && (n = space_len_at(s, b)) > 0;) b += n;
-    while (e > b) {
-        const size_t p = prev_start(s, e);
-        if (p < b || space_len_at(s, p) == 0) break;
-        e = p;
-    }
-    return s.substr(b, e - b);
-}
-
-std::string lstrip(const std::string &s)
-{
-    size_t b = 0;
-    for (size_t n; b < s.size() && (n = space_len_at(s, b)) > 0;) b += n;
-    return s.substr(b);
 }
 
 bool starts_with(const std::string &s, const char *prefix) { return s.rfind(prefix, 0) == 0; }
@@ -208,75 +124,6 @@ std::string format_num(const char *f, double v)
     return r;
 }
 
-// ------------------------------------------------------------------------------------------------
-// Word matcher equivalent to  re.compile(r"\b<L>([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE)
-// ------------------------------------------------------------------------------------------------
-
-struct WordMatch
-{
-    size_t begin = std::string::npos; // position of the letter
-    size_t end   = 0;                 // one past the number
-    double value = 0.;
-    explicit operator bool() const { return begin != std::string::npos; }
-};
-
-// Number at s[j]: [-+]?[0-9]*\.?[0-9]+ with the regex's backtracking. Returns the end or npos.
-size_t match_number(const std::string &s, size_t j)
-{
-    size_t k = j;
-    if (k < s.size() && (s[k] == '+' || s[k] == '-')) ++k;
-    const size_t d0 = k;
-    while (k < s.size() && is_digit(s[k])) ++k;
-    const size_t nd = k - d0;
-    if (k + 1 < s.size() && s[k] == '.' && is_digit(s[k + 1])) {
-        k += 2;
-        while (k < s.size() && is_digit(s[k])) ++k;
-        return k;
-    }
-    return nd >= 1 ? d0 + nd : std::string::npos;
-}
-
-double parse_number(const std::string &s, size_t b, size_t e)
-{
-    if (s[b] == '+') ++b;
-    return string_to_double_decimal_point(std::string_view(s.data() + b, e - b));
-}
-
-// letters: one or more upper-case letters accepted at the word position, e.g. "E" or "PS".
-WordMatch find_word(const std::string &s, const char *letters, size_t from = 0)
-{
-    for (size_t i = from; i < s.size(); ++i) {
-        const char c = s[i];
-        bool hit = false;
-        for (const char *l = letters; *l; ++l)
-            if (c == *l || c == lower(*l)) { hit = true; break; }
-        if (! hit || word_before(s, i))
-            continue;
-        const size_t e = match_number(s, i + 1);
-        if (e == std::string::npos)
-            continue;
-        WordMatch m;
-        m.begin = i;
-        m.end   = e;
-        m.value = parse_number(s, i + 1, e);
-        return m;
-    }
-    return {};
-}
-
-// re.sub(pattern, replacement, s) for the word pattern above.
-std::string replace_words(const std::string &s, const char *letters, const std::string &replacement)
-{
-    std::string r;
-    size_t pos = 0;
-    for (WordMatch m = find_word(s, letters, 0); m; m = find_word(s, letters, pos)) {
-        r.append(s, pos, m.begin - pos);
-        r += replacement;
-        pos = m.end;
-    }
-    r.append(s, pos, std::string::npos);
-    return r;
-}
 
 // ------------------------------------------------------------------------------------------------
 // Line classifiers equivalent to the v2 regular expressions (all case-insensitive)
@@ -382,31 +229,7 @@ bool is_motion(const std::string &s)
 // Settings
 // ------------------------------------------------------------------------------------------------
 
-struct Params
-{
-    double df                = 1.75;
-    double volumetric_ratio  = 0.;
-    double b_multiplier      = 1.;
-    bool   b_drivetrain      = false;
-    double lead_b            = 4.;
-    double i_gear_b          = 7.5;
-    int    a_mode            = diwaFlowScaled;
-    double k_screw           = 3.48;
-    bool   enable_retraction = true;
-    double max_retract_de    = 5.;
-    double max_retract_f     = 300.;  // mm/min
-    double post_dwell        = 0.;
-    bool   enable_uv         = true;
-    std::string uv_on        = "M62 P3 Q1";
-    std::string uv_off       = "M62 P3 Q0";
-    double uv_offset_y       = 112.538;
-    double uv_end_dwell      = 0.;
-    double uv_layer_dwell    = 5.;
-    // u-MEX powder mode (diw_powder_infill).
-    bool   umex              = false;
-    DIW::UMexParams          U;
-    std::vector<std::string> config_warnings;
-};
+using Params = DIW::TranslatorParams;
 
 double get_float(const DynamicPrintConfig &c, const char *key, double def)
 {
@@ -425,6 +248,7 @@ bool get_bool(const DynamicPrintConfig &c, const char *key, bool def)
 Params read_params(const DynamicPrintConfig &c)
 {
     Params p;
+    p.a_mode = diwaFlowScaled;
     p.df = get_float(c, "filament_diameter", p.df);
     const double d_syringe = get_float(c, "diw_syringe_diameter", 50.);
     // B from the paste volume each move needs: dV = dE * pi/4 * df^2, dB = dV / (pi/4 * D^2) = dE * (df/D)^2.
@@ -468,53 +292,28 @@ Params read_params(const DynamicPrintConfig &c)
 // Translator (DIWPostProcessor)
 // ------------------------------------------------------------------------------------------------
 
-class Translator
+class Translator : public DIW::UMexSequencer
 {
 public:
-    explicit Translator(const Params &p) : P(p), warnings(p.config_warnings) {}
+    Translator(const Params &p, bool stub_powder_stage) : DIW::UMexSequencer(p, stub_powder_stage) {}
 
-    std::string run(const std::vector<std::string> &raw_lines);
+    // blocks: the accepted ";DIW:" blocks (powder mode only).
+    std::string run(const std::vector<std::string> &raw_lines, const std::vector<DIW::PlacedBlock> &blocks);
 
 private:
-    using Lines = std::vector<std::string>;
+    // The state (cur_x, last_e, layer_count, warnings, ...) lives in DIW::UMexSequencer, which drives the
+    // core layers through process_line() and curing_sequence(), as v2's _UMexMixin does.
+    bool speed_mode() const override { return P.a_mode == diwaFlowScaled || P.a_mode == diwaProportional; }
 
-    const Params &P;
-
-    double cur_x = 0., cur_y = 0., cur_z = 0., cur_f = 1200.;
-    double last_e = 0.;
-    bool   relative_e = false;
-    double cumulative_b = 0., cumulative_a = 0.;
-    bool   is_extruding = false;
-    bool   uv_active = false;
-    int    layer_count = 0;
-    bool   extruded_on_layer = false;
-    bool   cured_for_layer_change = false;
-    bool   in_custom_start = false, startup_uv_check_done = false, in_initial_load = false, in_intro_line = false;
-    bool   suppress_uv_curing = false;
-    double nozzle_target_x = 0., nozzle_target_y = 0.;
-    bool   final_curing_done = false;
-    bool   in_config_block = false;
-    long   line_idx = -1, final_stop_object_idx = -1;
-    // u-MEX (v2 _UMexMixin)
-    std::vector<std::string> warnings;
-    bool   shutdown_done = false;
-
-    bool speed_mode() const { return P.a_mode == diwaFlowScaled || P.a_mode == diwaProportional; }
-
-    void   warn(const std::string &msg)
-    {
-        if (std::find(warnings.begin(), warnings.end(), msg) == warnings.end())
-            warnings.push_back(msg);
-    }
     Lines  umex_shutdown_lines();
     Lines  umex_banner() const;
     std::string sanitize_dwell(const std::string &tok, const std::string &code, const std::string &comment_suffix);
 
     void   compute_geometric_center(const std::vector<std::string> &raw_lines);
-    Lines  curing_sequence(double return_x, double return_y);
+    Lines  curing_sequence(double return_x, double return_y) override;
     Lines  trigger_final_curing();
     double delta_b(double delta_e) const;
-    Lines  process_line(const std::string &raw_line);
+    Lines  process_line(const std::string &raw_line) override;
     Lines  motion_block(const std::string &code, const std::string &comment_suffix);
     Lines  finalize();
 };
@@ -939,30 +738,7 @@ Translator::Lines Translator::finalize()
     return out;
 }
 
-// v2 _RE_LAYER_START.match: ^\s*;\s*(?:LAYER_CHANGE\b|LAYER\s*:\s*\d+), case-insensitive.
-static bool is_layer_start(const std::string &line)
-{
-    size_t i = 0;
-    for (size_t n; i < line.size() && (n = space_len_at(line, i)) > 0;) i += n;
-    if (i >= line.size() || line[i] != ';')
-        return false;
-    ++i;
-    for (size_t n; i < line.size() && (n = space_len_at(line, i)) > 0;) i += n;
-    const std::string rest = to_lower(line.substr(i));
-    if (rest.compare(0, 12, "layer_change") == 0 && ! word_at(rest, 12))
-        return true;
-    if (rest.compare(0, 5, "layer") != 0)
-        return false;
-    size_t q = 5;
-    for (size_t n; q < rest.size() && (n = space_len_at(rest, q)) > 0;) q += n;
-    if (q >= rest.size() || rest[q] != ':')
-        return false;
-    ++q;
-    for (size_t n; q < rest.size() && (n = space_len_at(rest, q)) > 0;) q += n;
-    return q < rest.size() && is_digit(rest[q]);
-}
-
-std::string Translator::run(const std::vector<std::string> &raw_lines)
+std::string Translator::run(const std::vector<std::string> &raw_lines, const std::vector<DIW::PlacedBlock> &blocks)
 {
     // Pass 1a: the last "; stop printing object" before the config block.
     for (size_t i = 0; i < raw_lines.size(); ++i) {
@@ -975,29 +751,21 @@ std::string Translator::run(const std::vector<std::string> &raw_lines)
     // Pass 1b: UV target = centre of the extruded bounding box + UV lamp offset.
     compute_geometric_center(raw_lines);
 
-    if (P.umex) {
-        // v2 _process_lines_umex: soft limits are not configurable yet, so they are never checked.
-        warn("machine soft limits (soft_limit_x/y/z_min/max) are NOT configured: powder, wiper and "
-             "Z-hop moves are neither range-checked nor clamped.");
-        bool has_layers = false;
-        for (const std::string &l : raw_lines) {
-            if (l.find("; CONFIG_BLOCK_START") != std::string::npos)
-                break;
-            if (is_layer_start(l)) { has_layers = true; break; }
-        }
-        if (! has_layers)
-            warn("no ;LAYER_CHANGE / ;LAYER: markers found: nothing converted.");
-    }
-
     std::string body;
     body.reserve(raw_lines.size() * 40);
-    for (size_t i = 0; i < raw_lines.size(); ++i) {
-        // A header line of the v2 post-processor is dropped, as v2 does.
-        if (starts_with(raw_lines[i], "; Post-Processed by DIW Post-Processor"))
-            continue;
-        line_idx = long(i);
-        for (const std::string &l : process_line(raw_lines[i]))
+    if (P.umex) {
+        // v2 _process_lines_umex: layer-aware, core layers re-emitted in the u-MEX stage order.
+        for (const std::string &l : process_lines_umex(raw_lines, blocks))
             body += l;
+    } else {
+        for (size_t i = 0; i < raw_lines.size(); ++i) {
+            // A header line of the v2 post-processor is dropped, as v2 does.
+            if (starts_with(raw_lines[i], "; Post-Processed by DIW Post-Processor"))
+                continue;
+            line_idx = long(i);
+            for (const std::string &l : process_line(raw_lines[i]))
+                body += l;
+        }
     }
     for (const std::string &l : finalize())
         body += l;
@@ -1032,13 +800,25 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
     // '\n' only (POWDER_RECORDS.md sections 1 and 4, as the reader and v2_blocks.strip_records do), so the
     // removal runs on the raw bytes before universal-newline splitting: a lone '\r' does not end a record
     // line, and a ";DIW:" after a lone '\r' is not a record and is not removed.
+    // In powder mode the records are read (parse_records on the raw input) before they are removed; each
+    // block's position is kept in the translator's line numbering: the number of G-code lines before it
+    // once the records are gone, counting every '\n', "\r\n" and lone '\r' as one line end.
     std::string kept;
     kept.reserve(gcode.size());
+    std::vector<std::pair<int, size_t>> record_pos;   // (1-based raw line of a record line, lines kept before it)
+    size_t kept_lines = 0;
+    int    raw_no     = 0;
     for (size_t pos = 0; pos < gcode.size();) {
         const size_t nl  = gcode.find('\n', pos);
         const size_t end = nl == std::string::npos ? gcode.size() : nl + 1;
-        if (gcode.compare(pos, 5, ";DIW:") != 0)
+        ++raw_no;
+        if (gcode.compare(pos, 5, ";DIW:") != 0) {
             kept.append(gcode, pos, end - pos);
+            for (size_t i = pos; i < end; ++i)
+                if (gcode[i] == '\n' || (gcode[i] == '\r' && (i + 1 >= end || gcode[i + 1] != '\n')))
+                    ++kept_lines;
+        } else
+            record_pos.emplace_back(raw_no, kept_lines);
         pos = end;
     }
     const std::string text = sanitize_utf8(kept);
@@ -1061,13 +841,33 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
         return gcode; // already translated
 
     const Params p = read_params(config);
-    // Core layers are not converted to powder yet (FEATURE_MAP milestone 4, increment 3), so a powder job
-    // would come out as paste only. Refuse it rather than print the wrong part.
-    if (p.umex && ! opts.allow_unconverted_powder)
-        throw DIWConfigError("u-MEX powder infill: core-layer conversion is not available in this build yet; "
-                             "turn \"u-MEX powder infill\" off");
-    Translator   t(p);
-    return t.run(lines);
+    std::vector<DIW::PlacedBlock> blocks;
+    if (p.umex) {
+        // A record error stops the export: the planner and the translator disagree about the file.
+        DIW::ParsedRecords recs = DIW::parse_records(gcode);
+        if (! recs.errors.empty()) {
+            const auto &[line, reason] = recs.errors.front();
+            std::string msg = "u-MEX powder records: the ;DIW: record at line " + std::to_string(line) + " of the G-code is invalid (" +
+                              reason + ")";
+            if (recs.errors.size() > 1)
+                msg += ", and " + std::to_string(recs.errors.size() - 1) + " more record error(s)";
+            throw DIWConfigError(msg + "; the powder plan cannot be used");
+        }
+        for (DIW::PowderLayerRec &r : recs.blocks) {
+            const auto it = std::lower_bound(record_pos.begin(), record_pos.end(), std::make_pair(r.begin_line, size_t(0)));
+            if (it == record_pos.end() || it->first != r.begin_line)   // the filter and the reader split lines alike
+                throw Slic3r::RuntimeError("DIW translation: internal error locating the ;DIW: block at line " + std::to_string(r.begin_line));
+            blocks.push_back({ std::move(r), it->second });
+        }
+        // Without any block no core layer is converted, so a powder job would come out as paste only.
+        // Refuse it rather than print the wrong part (the slicer does not write records yet, POWDER_PLAN
+        // increment 4); tests set allow_unconverted_powder to run it anyway.
+        if (blocks.empty() && ! opts.allow_unconverted_powder)
+            throw DIWConfigError("u-MEX powder infill: core-layer conversion is not available in this build yet; "
+                                 "turn \"u-MEX powder infill\" off");
+    }
+    Translator t(p, opts.stub_powder_stage);
+    return t.run(lines, blocks);
 }
 
 void diw_translate_gcode_file(const std::string &path, const DynamicPrintConfig &config)

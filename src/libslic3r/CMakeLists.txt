@@ -268,6 +268,8 @@ set(lisbslic3r_sources
     GCode/DIWTranslator.hpp
     GCode/DIWUMexParams.cpp
     GCode/DIWUMexParams.hpp
+    GCode/DIWUMexSequencer.cpp
+    GCode/DIWUMexSequencer.hpp
     GCode/ExclusionVolumePathCheck.cpp
     GCode/ExclusionVolumePathCheck.hpp
     GCode/ExclusionVolumeTravelAvoidance.cpp

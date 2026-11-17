@@ -89,8 +89,15 @@ announced number of pairs. `n` of a line RUN and of an FB is at least 2.
 
 - A block sits inside the layer it describes: after that layer's start marker and before the layer's first motion line.
   It holds at most one block per layer, and `k` must equal the layer's number.
+  - "Layer" is v2's `split_layers` chunk (`LayerChunk`, numbered from 1). A block that sits between a layer's last
+    line and the next start marker belongs to the earlier layer, so it fails the motion-line rule.
+  - In powder mode (since increment 3a), the translator checks this placement, `k` and `fp` for every block before
+    it emits anything. On reaching the layer, it also checks `z` / `h` against the layer and `F` / `s` / `fu` against
+    its own `resolve_powder_feed`. Stage 4 then traverses the RUN points in record order (increment 3b). A failed check, like any reader error, stops the export with `DIWConfigError`
+    (POWDER_PLAN.md, "Increment 3a results"). A layer is converted iff it carries a block.
 - The translator removes every line that starts with `;DIW:` before any other processing, in paste and powder modes alike.
   So a file with records and the same file without them translate identically, apart from what the records drive.
+  Paste mode ignores the records. Powder mode reads them first, from the raw input, with this section's reader.
   - "Line" here is the section 1 line, the one the reader sees: the raw input is split at `\n` only, and the
     removal (the line with its `\n`; a final line without `\n` likewise) happens before UTF-8 decoding and before
     the translator's universal-newline splitting. A lone `\r` therefore never splits a record line (the whole
@@ -172,5 +179,11 @@ diw_translate [--config-from-gcode] --fingerprint <in> [key=value ...]
 ```
 
 `diw/tests/compare_records.py` checks all three against `v2_blocks.py`, and checks the section 4 filter with
-`translate(F) == translate(strip_records(F))` on lone-CR input. A missing or unreadable `diw_translate.exe`
+`translate(F) == translate(strip_records(F))` on lone-CR input in paste mode. In powder mode it checks that the
+lone-CR record line stops the export with the reader's line and reason.
+
+Translation flags used by the powder tests: `--allow-unconverted-powder` runs a powder job that has no block, and
+`--stub-powder-stage` reduces stage 4 to its header comment line (increment 3a; POWDER_PLAN.md). Without it,
+stage 4 emits the block's runs (increment 3b). The
+sequencing itself is checked by `diw/tests/compare_sequencer.py`. A missing or unreadable `diw_translate.exe`
 stops it with exit 2, and a binary without one of the flags fails those checks; nothing is skipped.

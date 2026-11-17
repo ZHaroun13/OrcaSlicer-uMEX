@@ -15,7 +15,9 @@ Per corpus file and variant (v2 in real powder mode, no umex_n_bottom_layers ove
     --fingerprint must equal the Python dump / blocks / fingerprint byte for byte.
 Plus synthetic hostile inputs: the Python dump must show the expected errors, and the C++ dump must equal it.
 Plus the translator's record filter (section 4): translate(F) == translate(strip_records(F)) for the first corpus
-file's records with lone-CR lines injected, in paste and powder mode.
+file's records with lone-CR lines injected, in paste mode. Powder mode reads the records (increment 3a), so there
+the lone-CR record line must stop the export with the reader's line and reason, and a ";DIW:" after a lone CR must
+stay a comment while the blocks are still sequenced (compare_sequencer.py checks the sequencing itself).
 
 A missing or unreadable diw_translate.exe stops the run (exit 2); a binary without one of the flags fails every
 check that needs it. Exit code 0 when every check passes.
@@ -462,12 +464,42 @@ def main(argv):
             record(f"{name}.cpp_fingerprint", s, t)
 
             if ci == 0 and vname == base_name:
-                # section 4: translate(F) == translate(strip_records(F)), with lone-CR lines injected
+                # section 4: translate(F) == translate(strip_records(F)), with lone-CR lines injected (paste mode)
                 cut = rec_gcode.find(b";LAYER_CHANGE", rec_gcode.find(b";LAYER_CHANGE") + 1)
                 f_in = rec_gcode[:cut] + LONE_CR + rec_gcode[cut:]
                 f_strip = B.strip_records(f_in)
-                for mode, fl, mo in (("paste", [], ["diw_powder_infill=0"]),
-                                     ("powder", ["--allow-unconverted-powder"], ["diw_powder_infill=1"])):
+                # Powder mode reads the records since increment 3a (they drive the core layers), so there:
+                # - the first lone-CR piece is a record line holding a \r: the reader's error stops the export;
+                # - the second piece alone (";DIW:" after a lone \r, not a record) is kept as a comment, and the
+                #   blocks after it are still found in the right layers (positions count the lone \r as a line end).
+                errs = B.parse_records(f_in)[1]
+                p_in = os.path.join(work, f"{name}.lonecr.powder.error.gcode")
+                with open(p_in, "wb") as fh:
+                    fh.write(f_in)
+                s, t = cpp.translate(p_in, p_in.replace(".gcode", ".out.gcode"),
+                                     ["--config-from-gcode", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
+                                     p_in.replace(".gcode", ".log"))
+                want = [f"record at line {errs[0][0]} ", f"({errs[0][1]})"] if errs else ["<no reader error>"]
+                if s == "FAIL" and t.startswith("exit 3:") and all(w in t for w in want):
+                    s, t = "ok", t
+                else:
+                    s, t = "FAIL", f"want exit 3 with {want}, got {s} {t if isinstance(t, str) else '(output)'}"
+                record(f"{name}.cpp_translate_record_error.powder", s, t)
+                second = LONE_CR[LONE_CR.index(b"\n") + 1:]
+                f_in2 = rec_gcode[:cut] + second + rec_gcode[cut:]
+                p_in = os.path.join(work, f"{name}.lonecr.powder.kept.gcode")
+                with open(p_in, "wb") as fh:
+                    fh.write(f_in2)
+                s, t = cpp.translate(p_in, p_in.replace(".gcode", ".out.gcode"),
+                                     ["--config-from-gcode", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
+                                     p_in.replace(".gcode", ".log"))
+                if s == "ok":
+                    n_s1 = t.count(b" S1 paste contour ")
+                    ok = (t.count(b";DIW:") == 1 and b"\n;DIW:BEGIN v=1 k=1\n" in t and
+                          n_s1 == sum(1 for l in layers if l.st == "ok"))
+                    s, t = ("ok" if ok else "FAIL"), f"lone-CR ;DIW: kept as a comment, {n_s1} core layer(s) sequenced"
+                record(f"{name}.cpp_translate_lonecr.powder", s, t)
+                for mode, fl, mo in (("paste", [], ["diw_powder_infill=0"]),):
                     outs = []
                     for tag, body in (("with", f_in), ("stripped", f_strip)):
                         p_in = os.path.join(work, f"{name}.lonecr.{mode}.{tag}.gcode")

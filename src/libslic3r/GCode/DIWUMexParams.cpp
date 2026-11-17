@@ -60,6 +60,7 @@ std::pair<UMexParams, std::vector<std::string>> read_umex_params(const ConfigBas
         throw DIWConfigError("compaction_duration must be > 0");
     if (comp_t < 1.0)
         warns.push_back("compaction_duration = " + py_repr(comp_t) + " s is below the documented 1.0 s lower bound");
+    p.comp_t = comp_t;
 
     p.s_hatch  = num(c, "diw_powder_hatch_spacing", 1.2);
     p.m_dot    = num(c, "diw_powder_mass_flow", 6.24);
