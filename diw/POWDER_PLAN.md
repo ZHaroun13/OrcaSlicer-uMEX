@@ -26,7 +26,7 @@ needed until milestone 5.
 | # | Scope | Status |
 |---|---|---|
 | 1 | Translator powder mode, whole-file rules: `UMexParams` port (`GCode/DIWUMexParams`), Python-exact number formatting (`GCode/DIWPyCompat`), warning banner, G04 in seconds, M202, config-block sanitation, safe shutdown; production refuses powder jobs until core layers convert; golden harness `diw/tests/compare_powder.py` + corpus `diw/tests/corpus/cube25.gcode` | **done** |
-| 2 | Freeze record format v1 (`DIWPowderBlock` parser/writer, CRC-32, fingerprint); Python `v2_blocks.py` (v2 plans as records) and `v2_hooks.py` (capture / stub plans) | |
+| 2 | Freeze record format v1 ([POWDER_RECORDS.md](POWDER_RECORDS.md); `GCode/DIWPowderBlock` parser/writer, CRC-32, fingerprint); Python `v2_blocks.py` (v2 plans as records) and `v2_hooks.py` (capture / replay); `compare_records.py` | **done** |
 | 3a | Sequencing from records: S1, S2 wipe, S3 UV, S5 compaction, S6 (milestone 3); S4 stubbed on both sides | |
 | 3b | S4 powder emission from records (milestone 4); byte-identical with v2's own plans as records on all fixtures | |
 | 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | |
@@ -45,6 +45,27 @@ to non-core (`umex_n_bottom_layers = 10**6`):
 - `py_repr` / `py_g`: 20020/20020 values equal to Python `repr()` / `format(v, 'g')`.
 Paste mode (`compare_v2.py`): 0 failures, including the new already-post-processed-line case (v2 drops
 its own header line; the milestone 2 port did not).
+
+## Increment 2 results (17 Nov 2026)
+
+`compare_records.py` (197 checks, 0 failures, 0 skips):
+- v2 in real powder mode captured as records for cube25 under 8 variants plus a notched part. Together they cover all
+  block states (`ok`, `open`, `small`), line and point runs, and paste fallback paths.
+- **Replay:** v2 driven by plans read back from the records gives output byte-identical to plain v2.
+  A moved point changes the output, so replay really uses the records.
+- **C++ reader and writer:** `diw_translate --dump-records` / `--rewrite-records` / `--fingerprint` are
+  byte-identical to the Python reference.
+- **Hostile inputs:** about 20 cases (tampered CRC, nesting, nan, key order, lone CR, non-ASCII, ...) give the same
+  errors in C++ and Python.
+- **Record stripping:** the translator removes `;DIW:` lines from the raw bytes, so translating a file equals
+  translating the same file without its records.
+
+A three-lens adversarial review confirmed three defects, all fixed:
+- the lone-CR split mismatch;
+- a missing exe was counted as a skip instead of a failure;
+- variant checks could not fail.
+
+`compare_powder.py` and `compare_v2.py` still pass with 0 failures.
 
 ## Open questions (current defaults keep v2 parity)
 

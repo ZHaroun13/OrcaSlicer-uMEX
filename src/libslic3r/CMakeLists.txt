@@ -260,6 +260,8 @@ set(lisbslic3r_sources
     GCode/ConflictChecker.hpp
     GCode/CoolingBuffer.cpp
     GCode/CoolingBuffer.hpp
+    GCode/DIWPowderBlock.cpp
+    GCode/DIWPowderBlock.hpp
     GCode/DIWPyCompat.cpp
     GCode/DIWPyCompat.hpp
     GCode/DIWTranslator.cpp

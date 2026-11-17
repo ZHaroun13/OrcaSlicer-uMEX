@@ -1027,7 +1027,21 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
 {
     // Read as Python does: UTF-8 with errors="replace", universal newlines ("\n", "\r\n" and a lone "\r"
     // all end a line and become "\n"), lines keep their '\n' (readlines()).
-    const std::string text = sanitize_utf8(gcode);
+    // ";DIW:" powder records (diw/POWDER_RECORDS.md) are removed before anything else, in paste and
+    // powder modes alike, so a file translates the same with and without them. Record lines are split at
+    // '\n' only (POWDER_RECORDS.md sections 1 and 4, as the reader and v2_blocks.strip_records do), so the
+    // removal runs on the raw bytes before universal-newline splitting: a lone '\r' does not end a record
+    // line, and a ";DIW:" after a lone '\r' is not a record and is not removed.
+    std::string kept;
+    kept.reserve(gcode.size());
+    for (size_t pos = 0; pos < gcode.size();) {
+        const size_t nl  = gcode.find('\n', pos);
+        const size_t end = nl == std::string::npos ? gcode.size() : nl + 1;
+        if (gcode.compare(pos, 5, ";DIW:") != 0)
+            kept.append(gcode, pos, end - pos);
+        pos = end;
+    }
+    const std::string text = sanitize_utf8(kept);
     std::vector<std::string> lines;
     std::string cur;
     for (size_t i = 0; i < text.size(); ++i) {
