@@ -29,8 +29,18 @@ extern const char *DIW_TRANSLATION_HEADER;
 // True when the config describes a DIW / u-MEX machine (printer setting "diw_printer").
 bool diw_translation_enabled(const DynamicPrintConfig &config);
 
-// Translates G-code text. Line endings of the output are '\n'.
+struct DIWTranslateOptions
+{
+    // Powder mode (diw_powder_infill) only applies the whole-file rules so far (parameter checks,
+    // warning banner, G04 in seconds, M202, config-block sanitation, safe shutdown); core layers are not
+    // converted yet. Production refuses such a job with DIWConfigError; tests set this to run it anyway.
+    bool allow_unconverted_powder = false;
+};
+
+// Translates G-code text. Line endings of the output are '\n'. Throws DIWConfigError
+// (GCode/DIWUMexParams.hpp) for invalid u-MEX settings.
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config);
+std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config, const DIWTranslateOptions &opts);
 
 // Translates the file in place. Throws Slic3r::RuntimeError on I/O failure.
 void diw_translate_gcode_file(const std::string &path, const DynamicPrintConfig &config);

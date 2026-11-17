@@ -1,4 +1,6 @@
 #include "DIWTranslator.hpp"
+#include "DIWPyCompat.hpp"
+#include "DIWUMexParams.hpp"
 
 #include "../Exception.hpp"
 #include "../LocalesUtils.hpp"
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <tuple>
 #include <vector>
 
 // Port of the paste path of diw_engine.py 2.0.0 (DIWPostProcessor, powder off). The structure and the
@@ -399,6 +402,10 @@ struct Params
     double uv_offset_y       = 112.538;
     double uv_end_dwell      = 0.;
     double uv_layer_dwell    = 5.;
+    // u-MEX powder mode (diw_powder_infill).
+    bool   umex              = false;
+    DIW::UMexParams          U;
+    std::vector<std::string> config_warnings;
 };
 
 double get_float(const DynamicPrintConfig &c, const char *key, double def)
@@ -441,6 +448,19 @@ Params read_params(const DynamicPrintConfig &c)
     p.uv_offset_y    = get_float(c, "diw_uv_offset_y", p.uv_offset_y);
     p.uv_end_dwell   = get_float(c, "diw_uv_end_dwell", p.uv_end_dwell);
     p.uv_layer_dwell = get_float(c, "diw_uv_layer_dwell", p.uv_layer_dwell);
+
+    // v2 _umex_init: the parameters are validated up front (throws DIWConfigError), then the
+    // uncalibrated-offset warning.
+    p.umex = get_bool(c, "diw_powder_infill", false);
+    if (p.umex) {
+        std::tie(p.U, p.config_warnings) = DIW::read_umex_params(c, p.uv_on);
+        if (p.U.off_x == 0.0 && p.U.off_y == 0.0 && p.U.off_z == 0.0) {
+            const std::string w = "POWDER NOZZLE OFFSETS powder_offset_x/y/z ARE ALL 0.0 (UNCALIBRATED): powder would be "
+                                  "dispensed at the PASTE NOZZLE position. Calibrate before any hardware run.";
+            if (std::find(p.config_warnings.begin(), p.config_warnings.end(), w) == p.config_warnings.end())
+                p.config_warnings.push_back(w);
+        }
+    }
     return p;
 }
 
@@ -451,7 +471,7 @@ Params read_params(const DynamicPrintConfig &c)
 class Translator
 {
 public:
-    explicit Translator(const Params &p) : P(p) {}
+    explicit Translator(const Params &p) : P(p), warnings(p.config_warnings) {}
 
     std::string run(const std::vector<std::string> &raw_lines);
 
@@ -475,8 +495,20 @@ private:
     bool   final_curing_done = false;
     bool   in_config_block = false;
     long   line_idx = -1, final_stop_object_idx = -1;
+    // u-MEX (v2 _UMexMixin)
+    std::vector<std::string> warnings;
+    bool   shutdown_done = false;
 
     bool speed_mode() const { return P.a_mode == diwaFlowScaled || P.a_mode == diwaProportional; }
+
+    void   warn(const std::string &msg)
+    {
+        if (std::find(warnings.begin(), warnings.end(), msg) == warnings.end())
+            warnings.push_back(msg);
+    }
+    Lines  umex_shutdown_lines();
+    Lines  umex_banner() const;
+    std::string sanitize_dwell(const std::string &tok, const std::string &code, const std::string &comment_suffix);
 
     void   compute_geometric_center(const std::vector<std::string> &raw_lines);
     Lines  curing_sequence(double return_x, double return_y);
@@ -573,10 +605,63 @@ double Translator::delta_b(double delta_e) const
     return dl * P.b_multiplier;
 }
 
+Translator::Lines Translator::umex_shutdown_lines()
+{
+    // End-of-print safe state: A0.000, UV off, powder feeder off, compaction table off (v2 _umex_shutdown_lines).
+    Lines lines { "; --- uMEX safe shutdown ---\n" };
+    lines.emplace_back(speed_mode() ? "G1 A0.000\n" : "; (A held: cumulative position mode, no A0.000)\n");
+    lines.push_back(P.uv_off + "\n");
+    lines.push_back("M62 P" + std::to_string(P.U.powder_pin) + " Q0\n");
+    lines.push_back("M62 P" + std::to_string(P.U.comp_pin) + " Q0\n");
+    shutdown_done = true;
+    return lines;
+}
+
+Translator::Lines Translator::umex_banner() const
+{
+    // Comment banner listing every warning, placed right after the header line (v2 _umex_banner).
+    if (warnings.empty())
+        return {};
+    Lines lines { "; ======================= uMEX WARNINGS =======================\n" };
+    for (std::string w : warnings) {
+        std::replace(w.begin(), w.end(), '[', '(');
+        std::replace(w.begin(), w.end(), ']', ')');
+        lines.push_back("; WARNING (uMEX): " + w + "\n");
+    }
+    lines.emplace_back("; =============================================================\n");
+    return lines;
+}
+
+std::string Translator::sanitize_dwell(const std::string &tok, const std::string &code, const std::string &comment_suffix)
+{
+    // Powder mode: dwell in seconds, "G04 P0.500" (requirements 6.3). S is seconds; on a bare G4, P > 50 is
+    // Marlin milliseconds; a G4 P <= 50 is taken as seconds and reported (v2 _sanitize_dwell).
+    const WordMatch m   = find_word(code, "PS");
+    const double    val = m.value;
+    double          sec;
+    if (code[m.begin] == 'S' || code[m.begin] == 's')
+        sec = val;
+    else if (tok == "G4" && val > 50.0)
+        sec = val / 1000.0;
+    else {
+        sec = val;
+        if (tok == "G4" && val > 0.0)
+            warn("G4 P" + DIW::py_g(val) + " treated as " + DIW::py_g(val) + " SECONDS (document rule: only P > 50 is milliseconds)");
+    }
+    return "G04 P" + format_num("%.3f", sec) + comment_suffix + "\n";
+}
+
 Translator::Lines Translator::process_line(const std::string &raw_line)
 {
-    if (in_config_block)
-        return { raw_line };
+    if (in_config_block) {
+        if (! P.umex)
+            return { raw_line };
+        // Powder mode: the config footer is made bracket-free as well.
+        std::string l = raw_line;
+        std::replace(l.begin(), l.end(), '[', '(');
+        std::replace(l.begin(), l.end(), ']', ')');
+        return { l };
+    }
     if (raw_line.find("; CONFIG_BLOCK_START") != std::string::npos) {
         in_config_block = true;
         Lines out = trigger_final_curing();
@@ -711,6 +796,8 @@ Translator::Lines Translator::process_line(const std::string &raw_line)
                 uv_active = false;
             }
         }
+        if (P.umex && ! shutdown_done)
+            append(out, umex_shutdown_lines());
         if (tok == "M84") { // strip_m84
             out.push_back("; (FILTERED) " + code + comment_suffix + "\n");
             return out;
@@ -721,7 +808,8 @@ Translator::Lines Translator::process_line(const std::string &raw_line)
 
     static const char *prohibited[] = { "M104", "M109", "M140", "M190", "M105", "M106", "M107",
                                         "M73",  "M201", "M203", "M204", "M205", "M900", "M220", "M221" };
-    if (std::find_if(std::begin(prohibited), std::end(prohibited), [&tok](const char *p) { return tok == p; }) != std::end(prohibited))
+    if (std::find_if(std::begin(prohibited), std::end(prohibited), [&tok](const char *p) { return tok == p; }) != std::end(prohibited) ||
+        (P.umex && tok == "M202"))
         return { "; (FILTERED) " + code + comment_suffix + "\n" };
 
     if (tok == "G28") // strip_g28
@@ -730,6 +818,8 @@ Translator::Lines Translator::process_line(const std::string &raw_line)
     if (tok == "G4" || tok == "G04") {
         if (! find_word(code, "PS"))
             return { "; (FILTERED EMPTY G4) " + code + comment_suffix + "\n" };
+        if (P.umex)
+            return { sanitize_dwell(tok, code, comment_suffix) };
         return { code + comment_suffix + "\n" };
     }
 
@@ -844,7 +934,32 @@ Translator::Lines Translator::finalize()
         out.push_back(P.uv_off + "\n");
         uv_active = false;
     }
+    if (P.umex && ! shutdown_done)
+        append(out, umex_shutdown_lines());
     return out;
+}
+
+// v2 _RE_LAYER_START.match: ^\s*;\s*(?:LAYER_CHANGE\b|LAYER\s*:\s*\d+), case-insensitive.
+static bool is_layer_start(const std::string &line)
+{
+    size_t i = 0;
+    for (size_t n; i < line.size() && (n = space_len_at(line, i)) > 0;) i += n;
+    if (i >= line.size() || line[i] != ';')
+        return false;
+    ++i;
+    for (size_t n; i < line.size() && (n = space_len_at(line, i)) > 0;) i += n;
+    const std::string rest = to_lower(line.substr(i));
+    if (rest.compare(0, 12, "layer_change") == 0 && ! word_at(rest, 12))
+        return true;
+    if (rest.compare(0, 5, "layer") != 0)
+        return false;
+    size_t q = 5;
+    for (size_t n; q < rest.size() && (n = space_len_at(rest, q)) > 0;) q += n;
+    if (q >= rest.size() || rest[q] != ':')
+        return false;
+    ++q;
+    for (size_t n; q < rest.size() && (n = space_len_at(rest, q)) > 0;) q += n;
+    return q < rest.size() && is_digit(rest[q]);
 }
 
 std::string Translator::run(const std::vector<std::string> &raw_lines)
@@ -860,18 +975,38 @@ std::string Translator::run(const std::vector<std::string> &raw_lines)
     // Pass 1b: UV target = centre of the extruded bounding box + UV lamp offset.
     compute_geometric_center(raw_lines);
 
-    std::string out;
-    out.reserve(raw_lines.size() * 40);
-    out += DIW_TRANSLATION_HEADER;
-    out += '\n';
+    if (P.umex) {
+        // v2 _process_lines_umex: soft limits are not configurable yet, so they are never checked.
+        warn("machine soft limits (soft_limit_x/y/z_min/max) are NOT configured: powder, wiper and "
+             "Z-hop moves are neither range-checked nor clamped.");
+        bool has_layers = false;
+        for (const std::string &l : raw_lines) {
+            if (l.find("; CONFIG_BLOCK_START") != std::string::npos)
+                break;
+            if (is_layer_start(l)) { has_layers = true; break; }
+        }
+        if (! has_layers)
+            warn("no ;LAYER_CHANGE / ;LAYER: markers found: nothing converted.");
+    }
+
+    std::string body;
+    body.reserve(raw_lines.size() * 40);
     for (size_t i = 0; i < raw_lines.size(); ++i) {
+        // A header line of the v2 post-processor is dropped, as v2 does.
+        if (starts_with(raw_lines[i], "; Post-Processed by DIW Post-Processor"))
+            continue;
         line_idx = long(i);
         for (const std::string &l : process_line(raw_lines[i]))
-            out += l;
+            body += l;
     }
     for (const std::string &l : finalize())
-        out += l;
-    return out;
+        body += l;
+
+    std::string out = std::string(DIW_TRANSLATION_HEADER) + "\n";
+    if (P.umex)
+        for (const std::string &l : umex_banner())
+            out += l;
+    return out + body;
 }
 
 } // namespace
@@ -884,6 +1019,11 @@ bool diw_translation_enabled(const DynamicPrintConfig &config)
 }
 
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config)
+{
+    return diw_translate_gcode(gcode, config, DIWTranslateOptions());
+}
+
+std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config, const DIWTranslateOptions &opts)
 {
     // Read as Python does: UTF-8 with errors="replace", universal newlines ("\n", "\r\n" and a lone "\r"
     // all end a line and become "\n"), lines keep their '\n' (readlines()).
@@ -907,6 +1047,11 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
         return gcode; // already translated
 
     const Params p = read_params(config);
+    // Core layers are not converted to powder yet (FEATURE_MAP milestone 4, increment 3), so a powder job
+    // would come out as paste only. Refuse it rather than print the wrong part.
+    if (p.umex && ! opts.allow_unconverted_powder)
+        throw DIWConfigError("u-MEX powder infill: core-layer conversion is not available in this build yet; "
+                             "turn \"u-MEX powder infill\" off");
     Translator   t(p);
     return t.run(lines);
 }

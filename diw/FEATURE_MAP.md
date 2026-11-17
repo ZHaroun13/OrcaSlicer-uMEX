@@ -114,6 +114,8 @@ Each milestone is checked against the v2 post-processor output (step 4, golden t
    - Test: PlanetCNC flavor with all of these turned on gives the same G-code as the clean DIW preset
      (1939 lines, 0 differences).
 3. **Layer sequence**: nozzle wipe and compaction as fixed sequences (UV is done in milestone 2).
+   Wipe and compaction only occur inside v2's powder layers, so milestones 3 and 4 are built together;
+   see [POWDER_PLAN.md](POWDER_PLAN.md) (architecture C, increment 1 done).
 4. **Powder core**: `erPowder`, cavity offset, hatching, feed and I/O, nozzle offset. Must match v2 **powder** output on the test cube, and remove the `seam_gap 0%` requirement.
 5. **Preview + validation + time**.
 

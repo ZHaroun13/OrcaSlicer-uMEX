@@ -7198,7 +7198,8 @@ int CLI::run(int argc, char **argv)
                                     temp_time = (long long)Slic3r::Utils::get_current_time_utc();
                                     outfile = print_fff->export_gcode(outfile, gcode_result, nullptr);
                                     // DIW / u-MEX: the CLI runs no post-processing scripts, but the machine translation is built in.
-                                    if (diw_translation_enabled(print_fff->full_print_config()))
+                                    // ORCA_DIW_EXPORT_UNTRANSLATED (developer switch) keeps the raw file for the golden tests.
+                                    if (diw_translation_enabled(print_fff->full_print_config()) && ! std::getenv("ORCA_DIW_EXPORT_UNTRANSLATED"))
                                         diw_translate_gcode_file(outfile, print_fff->full_print_config());
                                     time_using_cache = time_using_cache + ((long long)Slic3r::Utils::get_current_time_utc() - temp_time);
                                     BOOST_LOG_TRIVIAL(info) << "export_gcode finished: time_using_cache update to " << time_using_cache << " secs.";
