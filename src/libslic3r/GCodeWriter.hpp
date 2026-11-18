@@ -341,6 +341,9 @@ public:
     static double quantize(double v, size_t ndigits) { return std::round(v * pow_10[ndigits]) * pow_10_inv[ndigits]; }
     static double quantize_xyz(double v, bool high_precision) { return quantize(v, xyz_digits(high_precision)); }
     static double quantize_e(double v, bool high_precision) { return quantize(v, e_digits(high_precision)); }
+    // The integer emit_axis() prints for v with the given number of decimals (the printed text is this value
+    // times 10^-digits). Shared with the DIW powder planner's frame transform (GCode::text_grid_nm).
+    static int64_t axis_units(double v, size_t digits) { return int64_t(std::round(v * pow_10[digits])); }
 
     void emit_axis(const char axis, const double v, size_t digits);
 

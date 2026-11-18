@@ -11,6 +11,7 @@
 #include "GCode/PressureEqualizer.hpp"
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
 #include "GCode/CoolingBuffer.hpp"
+#include "GCode/DIWPowderShadow.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include "CustomGCode.hpp"
 #include "GCode/TimelapsePosPicker.hpp"
@@ -2949,8 +2950,20 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         throw Slic3r::RuntimeError(err_msg);
     }
 
+    // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 3, H1): the binder filters every byte written to the file.
+    // The writer's spiral vase and axis remap are set up later in _do_export, so they are taken from the config here.
+    const auto diw_export_t0 = std::chrono::steady_clock::now();   // T10: export time, shadow on or off
+    m_diw_refusal.clear();
+    m_diw_shadow = DIW::PowderShadow::create(*print, print->full_print_config(), print->config().spiral_mode.value,
+                                             BeltTransformPipeline::axis_remap_enabled(print->config()), &m_diw_refusal);
+    if (m_diw_shadow)
+        file.attach_diw(m_diw_shadow.get());
+    else if (! m_diw_refusal.empty())
+        BOOST_LOG_TRIVIAL(info) << "DIW shadow planner off: " << m_diw_refusal;
+
     try {
         this->_do_export(*print, file, thumbnail_cb);
+        file.diw_finish();
         file.flush();
         if (file.is_error()) {
             file.close();
@@ -2960,7 +2973,9 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         }
     } catch (std::exception &ex) {
         // Rethrow on any exception. std::runtime_exception and CanceledException are expected to be thrown.
-        // Close and remove the file.
+        // Close and remove the file. The DIW shadow planner is dropped with it.
+        file.attach_diw(nullptr);
+        m_diw_shadow.reset();
         file.close();
         boost::nowide::remove(path_tmp.c_str());
         {
@@ -3049,6 +3064,22 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_processor.result().nozzle_group_result = m_print->get_layered_nozzle_group_result();
 
     m_processor.finalize(true);
+    BOOST_LOG_TRIVIAL(info) << "DIW export timing: export_ms="
+                            << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - diw_export_t0).count()
+                            << (m_diw_shadow ? " shadow=on" : " shadow=off");
+    // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 8): aggregated warnings and one summary line.
+    if (m_diw_shadow) {
+        for (const std::string &w : m_diw_shadow->warnings()) {
+            BOOST_LOG_TRIVIAL(warning) << w;
+            print->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, w);
+        }
+        BOOST_LOG_TRIVIAL(info) << m_diw_shadow->summary();
+        m_diw_shadow.reset();
+    } else if (! m_diw_refusal.empty()) {
+        const std::string w = "u-MEX native powder planner disabled: " + m_diw_refusal;
+        BOOST_LOG_TRIVIAL(warning) << w;
+        print->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, w);
+    }
     if (m_processor.get_result().exclusion_volume_path_conflict) {
         const int extruder_id = m_processor.get_result().exclusion_volume_conflict_extruder_id;
         std::string warning = extruder_id >= 0 ?
@@ -4579,6 +4610,8 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     // endpoint before the generator establishes its first model-space point,
     // so that first travel can be planned from the position the G-code actually
     // left the machine at rather than the default last_pos value.
+    // The processor only sees what the DIW binder released (diw/PLANNER_DESIGN.md 4, H3).
+    file.diw_sync();
     GCodeProcessor::PositionState startup_position = m_processor.get_current_position();
     const Vec2f plate_offset = m_writer.get_xy_offset();
     startup_position.position.x() += plate_offset.x();
@@ -6705,6 +6738,32 @@ LayerResult GCode::process_layer(
     m_last_layer_z = static_cast<float>(print_z);
     m_max_layer_z  = std::max(m_max_layer_z, m_last_layer_z);
     m_last_height = height;
+
+    // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 4, H4): capture the native geometry of this layer and
+    // write its ";DIWP <token> <id> m=<0|1>" placeholder; the binder removes it again.
+    if (m_diw_shadow) {
+        std::vector<DIW::CaptureLayer> diw_layers;
+        diw_layers.reserve(layers.size());
+        for (const LayerToPrint &l : layers)
+            diw_layers.push_back({ l.object_layer, l.support_layer, l.original_object });
+        DIW::ShadowFrame frame;
+        frame.writer_xy_offset = m_diw_xy_offset;
+        frame.extruder_offset  = m_config.extruder_offset.get_at(0);
+        frame.high_precision   = m_writer.high_precision();
+        frame.to_grid          = [this](const Point &p, const Vec2d &origin) { return this->text_grid_nm(p, origin); };
+        // A path takes the arc branch of the writer when path_uses_arcs() holds, but it prints a G2/G3 only for an arc
+        // segment of its fitting result that is not skipped as too short; a fit made of linear moves prints G1 only.
+        gcode += m_diw_shadow->capture(diw_layers, ordering, single_object_instance_idx, frame,
+                                       [this](const ExtrusionPath &p) {
+                                           if (! this->path_uses_arcs(p))
+                                               return false;
+                                           for (const PathFittingData &f : p.polyline.fitting_result)
+                                               if ((f.path_type == EMovePathType::Arc_move_cw || f.path_type == EMovePathType::Arc_move_ccw) &&
+                                                   f.arc_data.length * SCALING_FACTOR >= EPSILON)
+                                                   return true;
+                                           return false;
+                                       });
+    }
 
     // Set new layer - this will change Z and force a retraction if retract_when_changing_layer is enabled.
     if (! m_config.before_layer_change_gcode.value.empty()) {
@@ -9130,12 +9189,33 @@ void GCode::GCodeOutputStream::close()
 
 void GCode::GCodeOutputStream::write(const char *what)
 {
-    if (what != nullptr) {
-        const char* gcode = what;
-        // writes string to file
-        fwrite(gcode, 1, ::strlen(gcode), this->f);
-        //FIXME don't allocate a string, maybe process a batch of lines?
-        m_processor.process_buffer(std::string(gcode));
+    if (what == nullptr)
+        return;
+    if (m_diw != nullptr)
+        m_diw->feed(what, [this](std::string_view s) { this->write_raw(s.data(), s.size()); });
+    else
+        this->write_raw(what, ::strlen(what));
+}
+
+void GCode::GCodeOutputStream::write_raw(const char *what, size_t len)
+{
+    // writes string to file
+    fwrite(what, 1, len, this->f);
+    //FIXME don't allocate a string, maybe process a batch of lines?
+    m_processor.process_buffer(std::string(what, len));
+}
+
+void GCode::GCodeOutputStream::diw_sync()
+{
+    if (m_diw != nullptr)
+        m_diw->sync([this](std::string_view s) { this->write_raw(s.data(), s.size()); });
+}
+
+void GCode::GCodeOutputStream::diw_finish()
+{
+    if (m_diw != nullptr) {
+        m_diw->finish([this](std::string_view s) { this->write_raw(s.data(), s.size()); });
+        m_diw = nullptr;
     }
 }
 
@@ -10074,7 +10154,7 @@ std::string GCode::_extrude_piece(const ExtrusionPath &path, const std::string &
             }
             // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
             // Attention: G2 and G3 is not supported in spiral_mode mode
-            if (m_config.enable_arc_fitting.value == ArcFittingMode::Disabled || path.polyline.fitting_result.empty() || m_config.spiral_mode || sloped != nullptr || path.z_contoured || this->should_disable_arc_fitting()) {
+            if (! this->path_uses_arcs(path)) {
                 double path_length = 0.;
                 double total_length = sloped == nullptr ? 0. : path.polyline.length() * SCALING_FACTOR;
                 double saved_z      = m_writer.get_position().z();
@@ -11678,6 +11758,27 @@ Point GCode::gcode_to_point(const Vec2d &point) const
         pt += m_config.extruder_offset.get_at(extruder->extruder_id());
     return scaled<coord_t>(pt);
         
+}
+
+bool GCode::path_uses_arcs(const ExtrusionPath &path) const
+{
+    // BBS: use G1 if not enable arc fitting or has no arc fitting result or in spiral_mode mode or we are doing sloped extrusion
+    // Attention: G2 and G3 is not supported in spiral_mode mode
+    const ExtrusionPathSloped *sloped = dynamic_cast<const ExtrusionPathSloped*>(&path);
+    return ! (m_config.enable_arc_fitting.value == ArcFittingMode::Disabled || path.polyline.fitting_result.empty() || m_config.spiral_mode ||
+              sloped != nullptr || path.z_contoured || this->should_disable_arc_fitting());
+}
+
+Point GCode::text_grid_nm(const Point &p, const Vec2d &origin) const
+{
+    // point_to_gcode() with the given origin (its extruder offset: the DIW shadow refuses differing offsets), then the
+    // writer's plate offset (GCodeWriter::extrude_to_xy) and emit_axis' rounding; nm = printed integer * 10^(6 - d).
+    const Vec2d   extruder_offset = m_config.extruder_offset.get_at(0);
+    const Vec2d   g               = unscale(p) + origin - extruder_offset;
+    const Vec2d   on_plate        = { g(0) - m_diw_xy_offset.x(), g(1) - m_diw_xy_offset.y() };
+    const size_t  d               = size_t(GCodeFormatter::xyz_digits(m_writer.high_precision()));
+    const int64_t mul             = d == 4 ? 100 : 1000;
+    return Point(coord_t(GCodeFormatter::axis_units(on_plate.x(), d) * mul), coord_t(GCodeFormatter::axis_units(on_plate.y(), d) * mul));
 }
 
 Vec2d GCode::point_to_gcode_quantized(const Point& point) const

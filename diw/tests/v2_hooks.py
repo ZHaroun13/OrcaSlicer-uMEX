@@ -12,11 +12,21 @@
                                        sequencer will be driven. Returns (out_path, problems); problems lists
                                        every mismatch between v2's own z / h / s / F / fu and the records, and
                                        every layer v2 planned that has no block.
+  capture_geometry(E, cfg, src_path)   run v2 in real powder mode and return, for every core layer that reaches
+                                       plan_powder_layer, a GeomLayer: v2's inputs (LayerModel, UMexParams, h,
+                                       s_eff, z, F, fu), its plan and the intermediate geometry of the plan
+                                       (solid S, cavity C, Omega, narrow, revert) with WKT, recomputed by
+                                       v2_geometry (a step-for-step copy of plan_powder_layer) and checked against
+                                       the plan's own areas (diw/PLANNER_DESIGN.md T1).
+  v2_geometry(E, model, prm, sg)       that recomputation alone (None where v2 returns None).
 
 E is the imported v2 diw_engine module; cfg a v2 config dict with enable_u_mex_powder_infill set.
 Every patch is undone in a finally block. v2 itself is never modified on disk.
 """
 import contextlib
+import math
+import os
+import tempfile
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -181,3 +191,181 @@ def replay(E, cfg, src_path, records, out_path):
     for k in sorted(set(by_k) - rec_used):
         problems.append(f"layer {k}: record block never used")
     return out_path, problems
+
+
+# ----------------------------------------------------------------------------- geometry capture (planner T1)
+
+@dataclass
+class GeomLayer:
+    k: int
+    z: float
+    h: float
+    s: float
+    F: float
+    fu: float
+    st: str
+    plan: Any                   # v2 PowderPlan or None
+    model: Any                  # v2 LayerModel
+    prm: Any                    # v2 UMexParams
+    geom: Optional[dict]        # v2_geometry result (None for st=open)
+    wkt: dict                   # name -> WKT of solid, cavity, omega, narrow, revert ({} for st=open)
+    start: int = -1             # 0-based index of the layer's start-marker line (LayerChunk.start)
+
+
+def v2_geometry(E, model, prm, sg):
+    """The intermediate geometry of v2 plan_powder_layer (diw_engine.py 1025-1102), copied step for step:
+    returns {solid, cavity, omega_polys, omega, narrow, revert} or None where plan_powder_layer returns None."""
+    walls = [p for p in model.paths if p.kind == "wall"]
+    if not walls:
+        return None
+    loops = []
+    for p in model.paths:
+        if p.kind == "wall" and p.ptype in ("outer wall", "overhang wall") and len(p.points) >= 2:
+            pts = list(p.points)
+            if len(pts) >= 3 and math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1]) < E.LOOP_CLOSE_TOL_MM:
+                pts[-1] = pts[0]
+            loops.append(sg.LineString(pts))
+    if not loops:
+        return None
+    merged = sg.linemerge(loops)
+    solid = sg.Polygon()
+    n_rings = 0
+    for g in E._flat(merged, ("LineString",)):
+        c = list(g.coords)
+        if len(c) >= 4 and math.hypot(c[0][0] - c[-1][0], c[0][1] - c[-1][1]) < E.LOOP_CLOSE_TOL_MM:
+            solid = solid.symmetric_difference(sg.Polygon(c).buffer(0))
+            n_rings += 1
+    if n_rings == 0 or solid.is_empty:
+        return None
+    band = sg.unary_union([sg.LineString(p.points).buffer(p.width / 2.0, quad_segs=E.UMEX_QUAD_SEGS)
+                           for p in walls if len(p.points) >= 2])
+    cavity_walls_only = solid.difference(band)
+    paste_other = [p for p in model.paths if p.kind == "paste" and len(p.points) >= 2]
+    if paste_other:
+        excl = sg.unary_union([sg.LineString(p.points).buffer(p.width / 2.0, quad_segs=E.UMEX_QUAD_SEGS)
+                               for p in paste_other])
+        cavity = cavity_walls_only.difference(excl)
+    else:
+        cavity = cavity_walls_only
+    cavity = sg.unary_union([g for g in E._flat(cavity, ("Polygon",)) if g.area > 1e-6])
+    d_eff = prm.delta + E.POWDER_GUARD_MM
+    omega = cavity.buffer(-d_eff, quad_segs=E.UMEX_QUAD_SEGS) if not cavity.is_empty else cavity
+    omega_polys = [g for g in E._flat(omega, ("Polygon",)) if g.area > 1e-6]
+    if omega_polys:
+        opening = sg.unary_union(omega_polys).buffer(d_eff, join_style="mitre", quad_segs=E.UMEX_QUAD_SEGS)
+        narrow = cavity.difference(opening.buffer(1e-4))
+    else:
+        narrow = cavity
+    revert = [g for g in E._flat(narrow, ("Polygon",)) if g.area >= prm.paste_min_area]
+    return {"solid": solid, "cavity": cavity, "omega_polys": omega_polys,
+            "omega": sg.MultiPolygon(omega_polys) if omega_polys else sg.MultiPolygon(),
+            "narrow": narrow, "revert": sg.MultiPolygon(revert) if revert else sg.MultiPolygon()}
+
+
+def seg_widths(E, infos, chunk, width_fallback):
+    """The ;WIDTH: of every extruding move of a chunk, in file order (v2's per-path width rule applied per segment).
+    parse_core_layer appends the segments of each path contiguously and the paths in file order, so these are the
+    segment widths of the model's paths, flattened."""
+    return [li.width if li.width else width_fallback for li in infos[chunk.start:chunk.end] if li.is_extruding_move]
+
+
+def seg_width_model(E, model, widths):
+    """Review fix (variable-width paste): v2's LayerModel plus, for every wall / paste segment printed wider than its
+    path's first-segment width, that segment as an extra 2-point paste path at its own width - exactly the extra
+    exclusion the native planner adds (DIWPowderPlanner P2/P3). v2's buffer of a 2-point path is the segment's disk sum,
+    so v2 on this model plans the corrected cavity. The extra paths are paste: no ring, no fallback source."""
+    import copy
+    flat = [(p, i) for p in model.paths for i in range(len(p.points) - 1)]
+    if len(flat) != len(widths):
+        raise AssertionError(f"segment widths: {len(widths)} widths for {len(flat)} segments")
+    extra = []
+    for (p, i), w in zip(flat, widths):
+        a, b = p.points[i], p.points[i + 1]
+        if p.kind in ("wall", "paste") and w > p.width and a != b:
+            extra.append(E.PathRec(ptype=p.ptype, kind="paste", points=[a, b], seg_de=[0.0], seg_feed=[0.0], seg_raw=[],
+                                   width=w, z=p.z, pre_lines=[], travel_feed=None))
+    m = copy.copy(model)
+    m.paths = list(model.paths) + extra
+    # the per-segment widths of the original paths, by path index (shadow_export.verify_native_pieces)
+    m.path_seg_width = {}
+    j = 0
+    for i, p in enumerate(model.paths):
+        n = len(p.points) - 1
+        m.path_seg_width[i] = list(widths[j:j + max(n, 0)])
+        j += max(n, 0)
+    return m
+
+
+def capture_geometry(E, cfg, src_path, seg_width=True):
+    """seg_width: plan v2 on seg_width_model (the per-segment ;WIDTH: correction of the native planner, review fix);
+    False gives v2's own plan."""
+    layers: List[GeomLayer] = []
+    ctx = {}
+    sg0 = E._shapely()
+
+    def convert_wrap(orig):
+        def conv(self, raw_lines, infos, chunk, *a, **kw):
+            ctx.clear()
+            ctx["chunk"] = chunk
+            ctx["infos"] = infos
+            try:
+                return orig(self, raw_lines, infos, chunk, *a, **kw)
+            finally:
+                ctx.clear()
+        return conv
+
+    def feed_fn(orig):
+        def feed(*a, **kw):
+            res = orig(*a, **kw)
+            ctx["feed"] = res
+            return res
+        return feed
+
+    def plan_fn(orig):
+        def plan(model, prm, h, s_eff, sg):
+            chunk = ctx["chunk"]
+            if seg_width:
+                model = seg_width_model(E, model, seg_widths(E, ctx["infos"], chunk, prm.width_fallback))
+            p = orig(model, prm, h, s_eff, sg)
+            F, s2, fu, _ = ctx["feed"]
+            assert s2 == s_eff
+            st = "open" if p is None else ("small" if not p.runs else "ok")
+            g = v2_geometry(E, model, prm, sg0)
+            assert (g is None) == (p is None), f"layer {chunk.index}: v2_geometry disagrees with plan_powder_layer"
+            wkt = {}
+            if g is not None:
+                mine = (float(g["cavity"].area), float(sum(x.area for x in g["omega_polys"])),
+                        float(sum(x.area for x in g["revert"].geoms)), len(g["omega_polys"]))
+                theirs = (p.cavity_area, p.omega_area, p.revert_area, p.n_components)
+                assert mine == theirs, f"layer {chunk.index}: v2_geometry areas {mine} differ from the plan's {theirs}"
+                wkt = {n: g[n].wkt for n in ("solid", "cavity", "omega", "narrow", "revert")}
+            layers.append(GeomLayer(chunk.index, model.z, h, s_eff, F, fu, st, p, model, prm, g, wkt, chunk.start))
+            return p
+        return plan
+
+    fd, out = tempfile.mkstemp(suffix=".gcode")
+    os.close(fd)
+    try:
+        with _patched(E, convert_wrap, feed_fn, plan_fn):
+            E.DIWPostProcessor(cfg).process_file(src_path, out)
+    finally:
+        os.remove(out)
+    return layers
+
+
+def records_from_geometry(E, cfg, src_path, layers):
+    """(records_gcode, {k: block}) for capture_geometry layers: the source with v2's block of each layer inserted
+    right after its start-marker line, exactly as capture() writes it."""
+    fp = B.fingerprint(_params(E, cfg), E)
+    blocks = {L.k: B.write_block(L.k, L.st, L.z, L.h, L.s, L.F, L.fu, fp, L.plan) for L in layers}
+    with open(src_path, "rb") as fh:
+        lines = fh.read().splitlines(keepends=True)
+    after = {L.start: blocks[L.k].encode("ascii") for L in layers}
+    out = []
+    for i, l in enumerate(lines):
+        out.append(l)
+        if i in after:
+            if not l.endswith((b"\n", b"\r")):
+                out.append(b"\n")
+            out.append(after[i])
+    return b"".join(out), blocks

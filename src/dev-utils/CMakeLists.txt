@@ -36,8 +36,27 @@ if (ORCA_TOOLS)
 
     # diw_translate: runs the DIW / u-MEX G-code translation on an existing file (regression tests, diw/tests).
     add_executable(diw_translate diw_translate.cpp)
-    target_link_libraries(diw_translate libslic3r boost_headeronly)
+    target_link_libraries(diw_translate libslic3r boost_headeronly nlohmann_json)
     target_compile_definitions(diw_translate PRIVATE ${_DEV_DEFS})
+
+    # diw_planner_tests: the Catch2 unit tests of the DIW powder planner (tests/libslic3r/test_diw_planner.cpp,
+    # diw/PLANNER_DESIGN.md T9) as a stand-alone executable, so they build without BUILD_TESTS (which would
+    # pull in the whole test suite). With BUILD_TESTS the same file is part of libslic3r_tests instead.
+    if (NOT BUILD_TESTS)
+        if (NOT TARGET Catch2WithMain)
+            add_subdirectory(${CMAKE_SOURCE_DIR}/tests/catch2 ${CMAKE_BINARY_DIR}/diw_catch2 EXCLUDE_FROM_ALL)
+            if (MSVC)
+                target_compile_definitions(Catch2WithMain PRIVATE DO_NOT_USE_WMAIN)
+            endif ()
+        endif ()
+        set(_DIW_TEST_DATA_DIR ${CMAKE_SOURCE_DIR}/tests/data)
+        file(TO_NATIVE_PATH "${_DIW_TEST_DATA_DIR}" _DIW_TEST_DATA_DIR)
+        add_executable(diw_planner_tests ${CMAKE_SOURCE_DIR}/tests/libslic3r/test_diw_planner.cpp
+                                         ${CMAKE_SOURCE_DIR}/tests/libslic3r/test_diw_shadow.cpp)
+        target_link_libraries(diw_planner_tests libslic3r boost_headeronly nlohmann_json Catch2::Catch2WithMain)
+        target_compile_definitions(diw_planner_tests PRIVATE ${_DEV_DEFS} TEST_DATA_DIR=R"\(${_DIW_TEST_DATA_DIR}\)" CATCH_CONFIG_FAST_COMPILE)
+        target_include_directories(diw_planner_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+    endif ()
 
     # profile_include_dump: prints what included templates contribute to a vendor's presets,
     # to diff against the same tool built in BambuStudio. Built only on request.

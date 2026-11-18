@@ -121,6 +121,9 @@ using namespace nlohmann;
 
 namespace Slic3r {
 
+// PrintApply.cpp: TEST ONLY, ORCA_DIW_TEST_KEEP_SEAM_GAP=1 keeps a non-zero seam gap on DIW printers.
+bool diw_test_keep_seam_gap();
+
 Print::SlicingPipelineHookFn Print::s_slicing_pipeline_hook_fn = nullptr;
 
 template class PrintState<PrintStep, psCount>;
@@ -2094,7 +2097,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         for (const PrintObject *object : m_objects)
             for (const PrintRegion &region : object->all_regions()) {
                 const PrintRegionConfig &rc = region.config();
-                if (rc.seam_gap.value > 0.)
+                if (rc.seam_gap.value > 0. && ! diw_test_keep_seam_gap())
                     return { L("DIW / u-MEX machines need a seam gap of 0: an open wall seam leaks paste and leaves the "
                                "powder cavity open. Set \"Seam gap\" to 0 in this object's settings."),
                              object, "seam_gap" };

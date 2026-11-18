@@ -262,6 +262,10 @@ set(lisbslic3r_sources
     GCode/CoolingBuffer.hpp
     GCode/DIWPowderBlock.cpp
     GCode/DIWPowderBlock.hpp
+    GCode/DIWPowderPlanner.cpp
+    GCode/DIWPowderPlanner.hpp
+    GCode/DIWPowderShadow.cpp
+    GCode/DIWPowderShadow.hpp
     GCode/DIWPyCompat.cpp
     GCode/DIWPyCompat.hpp
     GCode/DIWTranslator.cpp
@@ -681,6 +685,14 @@ if (MSVC AND "${CMAKE_SIZEOF_VOID_P}" STREQUAL "4") # 32 bit MSVC workaround
 endif ()
 
 encoding_check(libslic3r)
+
+# DIW powder planner (diw/PLANNER_DESIGN.md): follows v2's floating point operation by operation, so no FMA
+# contraction (the .cpp also carries #pragma fp_contract(off)).
+if (MSVC)
+    set_source_files_properties(GCode/DIWPowderPlanner.cpp GCode/DIWPowderShadow.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+else ()
+    set_source_files_properties(GCode/DIWPowderPlanner.cpp GCode/DIWPowderShadow.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif ()
 
 target_compile_definitions(libslic3r PUBLIC -DUSE_TBB -DTBB_USE_CAPTURED_EXCEPTION=0)
 # CGAL changes Kd_tree's member layout when TBB is enabled. Match libslic3r_cgal

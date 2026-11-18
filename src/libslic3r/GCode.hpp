@@ -54,6 +54,7 @@
 #include "BeltBrim.hpp"
 
 namespace Slic3r { class ExtrusionEntityCollection; }
+namespace Slic3r { namespace DIW { class PowderShadow; } }
 
 namespace Slic3r {
 
@@ -266,7 +267,7 @@ public:
     void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
     void            export_layer_filaments(GCodeProcessorResult* result);
     //BBS: set offset for gcode writer
-    void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y);}
+    void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y); m_diw_xy_offset = {x, y}; }
     // IMEX firmware-managed slice: writer offset is augmented by the IMEX shift so the
     // emitted gcode is centered at bed origin (firmware fans copies/mirrors out from there).
     // Processor offset stays at plate_origin only so the gcode-preview visualizer renders
@@ -275,6 +276,7 @@ public:
     void set_gcode_offset_with_imex_shift(double x, double y, double imex_x, double imex_y) {
         m_writer.set_xy_offset(x + imex_x, y + imex_y);
         m_processor.set_xy_offset(x, y);
+        m_diw_xy_offset = {x + imex_x, y + imex_y};
     }
 
     // Exported for the helper classes (OozePrevention, Wipe) and for the Perl binding for unit tests.
@@ -287,6 +289,11 @@ public:
     Point           gcode_to_point(const Vec2d &point) const;
     Vec2d point_to_gcode_quantized(const Point& point) const;
     Vec3d                    point_to_gcode_quantized(const Point3& point) const;
+    // DIW powder planner (diw/PLANNER_DESIGN.md 5.3): the point as the writer prints it, on the 1 nm grid. origin is
+    // the instance origin set_origin() receives; the writer XY offset is m_diw_xy_offset; the rounding is emit_axis'.
+    Point           text_grid_nm(const Point &p, const Vec2d &origin) const;
+    // True when _extrude() writes this path with G2/G3 arcs (the arc-fitting gate, shared with the DIW capture).
+    bool            path_uses_arcs(const ExtrusionPath &path) const;
     const FullPrintConfig &config() const { return m_config; }
     const Layer*    layer() const { return m_layer; }
     GCodeWriter&    writer() { return m_writer; }
@@ -436,9 +443,20 @@ protected:
         // Formats and write into a file the given data.
         void write_format(const char* format, ...);
 
+        // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 4, H2): with a binder attached, every write goes
+        // through it; it holds the open layer and releases it, with its ;DIW: records, to write_raw().
+        void attach_diw(DIW::PowderShadow *diw) { m_diw = diw; }
+        // Releases every held line (before reading the processor state mid-export).
+        void diw_sync();
+        // End of the G-code: releases the last layer and detaches the binder.
+        void diw_finish();
+
     private:
+        void write_raw(const char *what, size_t len);
+
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        DIW::PowderShadow *m_diw = nullptr;
     };
 
     // Virtual hooks for belt printer subclass (BeltGCode).
@@ -883,6 +901,12 @@ protected:
                                          const std::string             &emitted_gcode);
 
     std::unique_ptr<CoolingBuffer>      m_cooling_buffer;
+    // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 3-5): null unless a u-MEX powder job.
+    std::shared_ptr<DIW::PowderShadow>  m_diw_shadow;
+    // Why the shadow planner was refused for this export (empty: not a powder job, or it runs).
+    std::string                         m_diw_refusal;
+    // The writer XY offset as the writer gets it (double; GCodeWriter::get_xy_offset() is a lossy Vec2f).
+    Vec2d                               m_diw_xy_offset { 0., 0. };
     std::unique_ptr<SpiralVase>         m_spiral_vase;
     std::unique_ptr<PressureEqualizer>  m_pressure_equalizer;
     

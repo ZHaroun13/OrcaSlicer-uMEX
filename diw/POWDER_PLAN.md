@@ -29,7 +29,7 @@ needed until milestone 5.
 | 2 | Freeze record format v1 ([POWDER_RECORDS.md](POWDER_RECORDS.md); `GCode/DIWPowderBlock` parser/writer, CRC-32, fingerprint); Python `v2_blocks.py` (v2 plans as records) and `v2_hooks.py` (capture / replay); `compare_records.py` | **done** |
 | 3a | Sequencing from records: S1, S2 wipe, S3 UV, S5 compaction, S6 (milestone 3); S4 stubbed on both sides (`GCode/DIWUMexSequencer`, `compare_sequencer.py`) | **done** |
 | 3b | S4 powder emission from records (milestone 4); byte-identical with v2's own plans as records on all fixtures | **done** |
-| 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | |
+| 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | **done** (18 Nov 2026): built and verified on the 191-slice matrix, T5 and the 10.1 stress variants; see "Increment 4 results" |
 | 5 | Product path: sparse infill suppressed on core layers, translator requires valid records, `seam_slope_type` forced off, validation rules | |
 | 6 | Added time and powder mass reported at export; documentation | |
 | 7 | Milestone 5 (one full rebuild): preview / time estimate read the records, Powder role colour | |
@@ -168,6 +168,199 @@ Final run: `compare_sequencer.py` 157 checks with and without `--stub-s4`, all 0
 
 Not reachable from records: v2's final `if not stopped` branch after a line run with `stop_s > 1e-9`. It would need
 the plain `cum` to end more than 1e-9 short of the compensated `total - d_early`. The port keeps it as is.
+
+## Increment 4 results (18 Nov 2026)
+
+Design: [PLANNER_DESIGN.md](PLANNER_DESIGN.md). The slicer core now plans the powder geometry at export time, in
+shadow mode:
+- `GCode/DIWPowderPlanner` holds P0-P8, the analytic hatch, coverage, centroid, InteriorPointArea, the FB split and
+  the LineMerger port.
+- `GCode/DIWPowderShadow` captures in `process_layer` and runs the streaming binder in `GCodeOutputStream::write`.
+- `GCodeScanner` / `ChunkTracker` were refactored out of `scan_gcode` / `split_layers`.
+- `diw_translate` gained `--plan-json` and `--plan-records`.
+
+The records are written into the G-code and nothing else in the file changes. A block is written only where the
+native and text classifications agree.
+
+The final build is from 18 Nov 22:07 (`OrcaSlicer.dll`; `diw_translate.exe` and `diw_planner_tests.exe` 22:09),
+after `build_slicer_diw.ps1` ended with `SLICER EXIT CODE: 0`. It contains the nine review fixes ("Review fixes"
+below and in PLANNER_DESIGN.md), and every gate in the table was rerun on it or on the 21:25 build, which differs
+from it only in comments. The Python side is 3.15.0 with shapely 2.2.0 and GEOS 3.14.1, and v2 was unmodified.
+Python runs use `py -3.15 -E -s` (see the deviations).
+
+| Test | Scope | Result |
+|---|---|---|
+| T0 regression | 5 corpus files, final build | `compare_sequencer.py` 157 ok with and without `--stub-s4`; `compare_records.py` 486 ok; `compare_powder.py` 62 ok; `compare_v2.py` 54 ok; all with 0 failures and 0 skips. Rerun after every stage. |
+| T9 planner units + T8 binder streams | Catch2, `diw_planner_tests` | 3489 assertions in 25 test cases, all passed (the review added the T8 case "placeholder-like custom G-code" and the cases "Review fix 2" and "Review fix 3"). |
+| T1 pure planner vs v2, with T3 and T4(a-c) | corpus x variants, plus the notch and synthetics at 5 hatch angles (`compare_planner.py`) | 3443 checks, 0 failures. st/nc 492, areas/shape/hatch 488, fb 454, T3 454, T4a 79, T4b 420, T4c 79, D5 1. |
+| Offline replay (stage 3 checkpoint) | `compare_replay.py`, corpus x `compare_records` variants + notch | 380 checks, 0 failures. BEGIN fields and st are string-equal to v2's. |
+| T7 + T2(a)(b) + T6 (stage 4 checkpoint) | cube25, two_objects | 49 checks, 0 failures. The kill-switch export equals the pre-increment build; the statistics lines are equal; capture, plan and binder faults all degrade cleanly. |
+| Step 5a, slicing matrix | 191 slices (`shadow_export.py --matrix --slice-only`) | 1915 checks, 0 failures. 3153 native blocks, one per v2 text-core layer. Every planner summary is clean. |
+| T2(a-e) + T3 | the same 191 slices | 25515 checks, 0 failures: T2a 1910, T2b 191, T2c 3726, T2d 191, T2e 382, T3 3153, areas/fb/hatch/shape/st_nc 3153 each, and D5 192 (per slice and overall). The disagreement counter is 0. `single_bead` is 0 on every slice. |
+| T4(d) | cube25, cone, lshape, shifted by 1 µm and 10 µm | 40 checks, 0 failures. |
+| T10 | cube25, cone | 1.135x and 1.116x the kill-switch export time (limit 1.2x, best of 5); planner 33.3 ms and 32.1 ms; `max_held` = 1. |
+| T5 seam gap 15 % | cube25, ring, notch, lshape x classic/Arachne (8 slices) | 1150 checks, 0 failures: T5i 8, T5ii 32, T5iv 16 (+168 per kind), T5v 184, D5 9. |
+| Review regressions | `regress_review.py` R1-R9 (CLI exports, the matrix slices, the corpus) | 40 checks, 0 failures. |
+| T2(a-e) + T3 on the stress variants | 16 slices (`shadow_export.py --matrix --stress`): by-object sequential (two_objects, lshape x2, multi-height), objects at 0.2 and 0.3 mm layer height (classic, Arachne), PE + fan speed-up + cooling slowdown (cube25, cone, overhang), arc fitting (cube25 + ring plate, classic and Arachne; sparse-infill-only arcs on cube25), scarf seam (cube25, ring, Arachne lshape with `all`), policy=error with an overflow (cube25, cone) | 2621 checks, 0 failures: S6 (variant reached) 47, T2a 160, T2b 18, T2c 334, T2d 16, T2e 28, T3 333, areas/fb/hatch/shape/st_nc 333 each, and D5 15. The disagreement counter is 0 on every slice. |
+
+Measured values:
+
+**T2 matrix** (the metrics are those of the accepted comparisons since the review fixes):
+- Hausdorff: C 1.5 µm (after the 10 µm opening), Ω 0.77 µm, runs 1.24 µm. Before the fix the summary showed Ω 2.1
+  and runs 3.8 µm, measured on rejected first comparisons.
+- Point dwells: position 0.14 µm, d rel. 2.7e-3. `fb_pos` 0.
+- D5: 117 of 3350 components have a row on a horizontal Ω edge. All are now compared without their edge rows; none
+  is excluded.
+- Arbitration logs: v2 discretization 342, D2 native band 42 (all `d2_seam_tail`, pieces verified against the
+  text), Ω ill-conditioned (exact clearance) 17 with hatch and fb self-checked, tight excess 7, v2 at finer arcs 1,
+  ra ill-conditioned 5, ra exceptions 0.
+
+**T3:** the minimum record slack is −2.6e-7 mm, against the −10 nm tolerance. After rounding to 3 decimals it is
+3.2e-4 mm. v2's own minimum is −3.4e-4 mm. Paths printed wider than their first-segment `;WIDTH:` are obstacles at
+their own width.
+
+**T5:**
+- v2 gives st=open on all 168 core layers at 15 %. Native gives ok on every core layer, with the same k set as at 0 %.
+- T5(iii), reported: cube25 and lshape are within 1e-6 relative and 0.5 µm.
+- Ring and notch reach 1.8e-5 relative area, an Ω Hausdorff of 3.9 µm and a run Hausdorff of 2.1 µm. The cause is
+  in the text inputs: rounded seam vertices in B_text and concentric solid infill clipped by the gap. The native
+  inputs are identical at 0 % and 15 %.
+- T5(v): the minimum slack is 4.4e-7 mm, and the translator accepts all 16 files.
+- T5(iv) metrics of the accepted comparisons: Ω Hausdorff 0.72 µm, runs 1.27 µm (the summary used to show the
+  3.9 µm of the rejected first comparisons).
+
+**Stress variants (step 6b):**
+- Every variant is shown to reach what it stresses (S6): the overrides are in the config block; G2/G3 on 14
+  otherwise-core chunks per arc plate; both layer-height grids printed; z drops between objects in sequential
+  mode; a z ramp in the outer wall with the scarf; moves at the cooling-slowdown floor speed.
+- No block sits on an arc or G91 chunk. The arc plates get blocks on the 25 cube-only layers above the ring.
+- Hausdorff: C 1.15 µm, Ω 0.72 µm, runs 0.47 µm. T3 minimum slack 4.4e-7 mm (3 decimals: 4.4e-4 mm).
+- policy=error: every v2 text-core layer carries the `st=open` carrier with s = s_hatch and F = fu = f_calc > f_max.
+  v2 and `diw_translate` abort with the same message at the first carrier's layer.
+- Scarf seam: v2 cannot plan the scarf text. It gives st=open on every core layer of cube25 and lshape, and plans the
+  ring without its outer ring, with Ω of 118.7 instead of 47.9 mm². The native blocks equal the native blocks of the
+  same part without the scarf: they are byte-equal on cube25, and ca differs by 5e-4 mm² on the ring. The reference
+  is therefore v2 on the no-scarf export (like T5(iv)). All 52 layers pass the T2(c) tolerances against it.
+- Found and fixed: the capture's arc predicate treated every path with an arc-fitting result as arc-printed. A fit
+  made only of linear moves prints G1, so with sparse-infill arc fitting on cube25 all 32 core layers were
+  `disagree_text_only`. The predicate now also requires an arc segment that the writer prints.
+
+**Review fixes (18 Nov 2026).** An adversarial review confirmed nine defects; all are fixed, each with a regression
+test (`regress_review.py` R1-R9 and Catch2 cases). Product code:
+- the `;DIWP` placeholders carry a per-export token, so user custom G-code that looks like a placeholder is no longer
+  deleted from the export or counted as a capture;
+- a wall printed as one bead (an Arachne odd centreline loop, a classic thin-wall loop) is no longer a cavity ring,
+  so no powder is planned into the empty bore of a thin tube (`single_bead=<n>` in the summary line);
+- text paths whose later segments are printed wider than the first (variable-width gap fill) are excluded at each
+  segment's own `;WIDTH:`, so runs no longer land inside the printed bead.
+Harness: the D2 / seam-band references verify the native pieces against the printed text; the T1 ra exception is
+bounded; the ill-conditioned-Ω path checks hatch and fallbacks; the quad_segs 256 arbitration requires the same
+plan; statistics come from the accepted comparisons; the D5 exclusion is bounded and D5 components are compared
+without their edge rows.
+
+Logs are in the session scratchpad `planner/`: `fx_cp2.log` (T1), `fx_5a.log` (5a), `fx_t2b.log` (T2 + T3),
+`fx_t4d.log`, `fx_t10.log`, `fx_t5.log`, `fx_st.log` (stress variants), `fx_rp.log` (replay), `fx_s4.log` (stage-4
+checkpoint), `fx_rr.log` (review regressions) and `t0s6b/*.log` (T0 on the final build).
+
+### Divergences from v2 (D1-D8, design section 9) as measured
+
+- **D1, seam gap.** Confirmed by T5: v2 gives st=open on every core layer; native closes the loops and plans them.
+  The scarf seam shows the same v2 weakness: the scarf retraces the loop with a z ramp, and v2's snap + linemerge
+  no longer forms the ring.
+- **D2, Arachne variable widths.** The band is B_native ∪ B_text. On 42 matrix layers the T2 reference was v2
+  with the verified native band added; on all of them the difference is the closed native loop covering its
+  unprinted seam tail (classic and Arachne), not a width.
+- **D3, inner-wall overhang pieces.** No case was logged on the matrix. The core set equals v2's on all 191 slices.
+- **D4, mitre tips under 23°.** Removed. P5 ports GEOS's limited mitre, and the 15° and 22° tip synthetics revert
+  exactly what v2 reverts.
+- **D5, rows on a horizontal Ω edge.** 2 components in T1 and 117 of 3350 in T2 have such a row. They are compared
+  without their edge rows; none is excluded (the bound is < 5 % per slice and overall).
+- **D6, two native-core placeholders in one chunk.** None occurred.
+- **D7, Ω containment in v2's Ω ⊕ 0.3 µm.** Holds. Where v2's own Ω is ill-conditioned, the T2(c) arbitration
+  rules apply (see the deviations below).
+- **D8, planner failures.** None occurred; the planner summary is clean on every slice.
+
+### Deviations from PLANNER_DESIGN.md
+
+The details are in that file's Deviations section.
+
+**Harness and process**
+- Python runs use `py -3.15 -E -s` instead of `python -I`, because `-I` breaks the harnesses' sibling imports.
+- `diw_planner_tests` is a dev-utils target, because this build tree has no `BUILD_TESTS`.
+- `--plan-records` also takes the translate-mode settings and `--feed-size`.
+- `compare_replay.py` is the stage-3 checkpoint.
+- T7's pre-increment baseline is the stage-3 build.
+- The CLI log goes through `--logfile`.
+- The matrix varies one factor at a time (191 slices) instead of the full product.
+- The repo meshes are scaled with `--scale`.
+- The 5a and T2 passes are separate (`--slice-only`, `--reuse`).
+- `--only T10` runs T10 alone.
+
+**Scanner and binder**
+- `ChunkTracker` has `finish()` and `n_opened()`, and queues closed chunks.
+- `PowderShadow` has a direct constructor, plus `load_dump_dir`, `feed(string_view)` and `stats()`.
+- The config-block test is "the line contains `; CONFIG_BLOCK_START`".
+- On an exception, held lines are released in order.
+- The `sync` and `lost_placeholder` accounting are defined.
+- In `text_only` mode, gate 0 is skipped and a missing capture falls back to the adapter.
+- The dump JSON schema is fixed.
+- The summary line adds `max_held`, `capture_ms` and `binder_ms`.
+
+**Capture**
+- Placeholders are `;DIWP <token> <id> m=<0|1>` with a per-export token; other `;DIWP` text passes through.
+- A ring needs the layer's slice beyond the bead on one side (`bead_bounds_slice`); single-bead walls are no ring.
+- Text paths carry per-segment widths; segments wider than the first are dilated at their own width.
+- The arc predicate passed to `capture` requires a printed arc segment, not just an arc-fitting result (found by the
+  stress variants).
+- `capture` takes `CaptureLayer`s, because `LayerToPrint` is nested in `GCode`.
+- `ShadowFrame` carries a `to_grid` callback.
+- `create()` runs at H1 and reads spiral mode and the axis remap from the config.
+- A `DIWConfigError` refuses silently.
+- Warnings are also logged.
+- The instance set depends on sequential mode.
+- A connected all-wall, single-width loop is stored as one closed piece.
+- An exception before the classification writes `m=1`.
+- In passthrough, a placeholder's capture is consumed with its line.
+- The gate 9 frame tolerance is `10^-d·√2 + 1 nm`.
+
+**Geometry**
+- The dilations and the erosion are unions of exact circumscribed pieces (1024 steps per 360°, radius + 1 nm), not
+  chord-padded `ClipperOffset` calls. For speed (T10), they are now built as raw offset paths on a global angle grid,
+  with these additions:
+  - arc caps that lie outside S are replaced by chords;
+  - duplicate closed curves are dropped;
+  - T9 checks the raw paths against the piece construction.
+- 256 and 512 steps per 360° were rejected, because T1 fails with them.
+- P0-P5 run in an integer-shifted local frame.
+- `PlanInput::open_outer` is a field, and P1b (snap + LineMerger) runs inside the planner.
+- The P5 opening is a GEOS limited-mitre port after a 10 nm Douglas-Peucker simplification. This removes D4.
+- narrow is taken of C opened by 100 nm.
+- P4 computes (S eroded) − (X dilated by w/2 + D) instead of eroding C.
+- The booleans call Clipper2 directly, with parallel per-polyline unions.
+
+**Tolerances and arbitration (all logged)**
+- The C Hausdorff is taken after a 10 µm opening.
+- A case that passes against v2 at quad_segs 256 counts as v2's arc discretization.
+- ra is accepted inside v2's own quad_segs spread.
+- Point dwells use first-order area and centroid bounds.
+- T4(b) bounds scale with boundary length and corner angle.
+- T4(c) uses 1e-5 relative areas.
+- T2(c) also accepts v2 at finer arcs, and the "tight excess" over an ill-conditioned v2 Ω.
+- The T2(e) header run-count line may differ only where T2(c) accepted a different run count.
+- T5(iv) falls back to the `t5_band_model` reference (20 layers).
+- In T5, T3 is done against each block's own text.
+- Scarf slices use v2 on the no-scarf export as the reference, with T3 done against each block's own text.
+- policy=error slices replace T2(e), since there is no output to diff, by the equal-abort-message check.
+
+**Test-only settings**
+- `ORCA_DIW_TEST_KEEP_SEAM_GAP=1` (PrintApply.cpp / Print.cpp) lets a DIW export keep a seam gap for T5. Without it,
+  nothing changes.
+- `ORCA_DIW_TEST_KEEP_FDM=1` (PrintApply.cpp) keeps arc fitting and the cooling slowdown on a DIW export for the
+  stress variants. Without it, nothing changes.
+- Objects at two layer heights come from a CLI assemble list (per-object `layer_height`), and the arc variants use a
+  cube25 + ring plate.
+- The prime-tower variant uses `wipe_tower_type = type1` and a `;TYPE:Prime tower` tag. Upstream WipeTower2 crashes
+  with one tool.
 
 ## Open questions (current defaults keep v2 parity)
 

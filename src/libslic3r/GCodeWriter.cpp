@@ -1689,11 +1689,10 @@ bool GCodeWriter::need_toolchange(unsigned int filament_id)const
 
 void GCodeFormatter::emit_axis(const char axis, const double v, size_t digits) {
     assert(digits <= 9);
-    static constexpr const std::array<int, 10> pow_10{1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
     *ptr_err.ptr++ = ' '; *ptr_err.ptr++ = axis;
 
     char *base_ptr = this->ptr_err.ptr;
-    auto  v_int    = int64_t(std::round(v * pow_10[digits]));
+    auto  v_int    = axis_units(v, digits);
     // Older stdlib on macOS doesn't support std::from_chars at all, so it is used boost::spirit::karma::generate instead of it.
     // That is a little bit slower than std::to_chars but not much.
 #ifdef __APPLE__

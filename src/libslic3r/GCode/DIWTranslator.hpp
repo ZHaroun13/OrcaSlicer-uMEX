@@ -23,6 +23,7 @@
 namespace Slic3r {
 
 class DynamicPrintConfig;
+namespace DIW { struct TranslatorParams; }
 
 // First line of a translated file. A file that already starts with it is left unchanged.
 extern const char *DIW_TRANSLATION_HEADER;
@@ -49,6 +50,10 @@ struct DIWTranslateOptions
 // (GCode/DIWUMexParams.hpp) for invalid u-MEX settings.
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config);
 std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConfig &config, const DIWTranslateOptions &opts);
+
+// The translator's settings read from the full print config (GCode/DIWUMexSequencer.hpp). Throws
+// DIWConfigError for invalid u-MEX settings, with the message the translator gives.
+DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &config);
 
 // Translates the file in place. Throws Slic3r::RuntimeError on I/O failure.
 void diw_translate_gcode_file(const std::string &path, const DynamicPrintConfig &config);

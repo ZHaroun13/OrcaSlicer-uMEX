@@ -1,4 +1,5 @@
 #include "ClipperUtils.hpp"
+#include <cstdlib>
 #include "IMEXHelpers.hpp"
 #include "Geometry.hpp"
 #include "CustomGCode.hpp"
@@ -1353,6 +1354,21 @@ void Print::update_shrinkage_compensation(size_t num_extruders, std::vector<int>
 // - On a DIW machine the FDM features that break paste extrusion are forced off. They are set here, before
 //   the config is compared with the previous one, so the result is stable and is what the G-code config
 //   block reports. Per-object overrides of the region settings are rejected by Print::validate().
+bool diw_test_keep_seam_gap()
+{
+    const char *v = std::getenv("ORCA_DIW_TEST_KEEP_SEAM_GAP");
+    return v != nullptr && v[0] == '1' && v[1] == 0;
+}
+
+// TEST ONLY (diw/PLANNER_DESIGN.md section 10.1 stress variants): ORCA_DIW_TEST_KEEP_FDM=1 keeps arc fitting and the
+// cooling slowdown, so the powder planner can be tested on arc-fitted layers and on CoolingBuffer slowdowns. Never set
+// it for a real print.
+static bool diw_test_keep_fdm()
+{
+    const char *v = std::getenv("ORCA_DIW_TEST_KEEP_FDM");
+    return v != nullptr && v[0] == '1' && v[1] == 0;
+}
+
 static void apply_diw_overrides(DynamicPrintConfig &cfg)
 {
     if (auto *flavor = cfg.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor"); flavor && flavor->value == gcfPlanetCNC) {
@@ -1364,12 +1380,17 @@ static void apply_diw_overrides(DynamicPrintConfig &cfg)
         return;
     // Values already off are left as they are, so a correct preset is reported unchanged.
     // An open seam leaks paste at the loop ends and leaves the u-MEX powder cavity open.
-    if (auto *o = cfg.option<ConfigOptionFloatOrPercent>("seam_gap"); o && o->value != 0.)
-        o->value = 0.;
+    // TEST ONLY (diw/PLANNER_DESIGN.md T5): ORCA_DIW_TEST_KEEP_SEAM_GAP=1 keeps a non-zero seam gap, so the powder
+    // planner can be tested on open wall seams. Never set it for a real print.
+    if (! diw_test_keep_seam_gap())
+        if (auto *o = cfg.option<ConfigOptionFloatOrPercent>("seam_gap"); o && o->value != 0.)
+            o->value = 0.;
     // Wipes drag the nozzle through fresh paste.
     for (const char *key : { "wipe_on_loops", "wipe_before_external_loop" })
         if (auto *o = cfg.option<ConfigOptionBool>(key))
             o->value = false;
+    if (diw_test_keep_fdm())
+        return;
     // Arcs: the auger command and the powder planner work on straight segments.
     if (auto *o = cfg.option<ConfigOptionEnum<ArcFittingMode>>("enable_arc_fitting"))
         o->value = ArcFittingMode::Disabled;

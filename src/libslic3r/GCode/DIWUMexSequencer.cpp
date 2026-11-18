@@ -118,10 +118,10 @@ std::string path_kind(const std::string &ptype)
     return "paste";
 }
 
+} // namespace
+
 // Python truthiness of an Optional[float]: None and 0.0 are false.
 bool truthy(const std::optional<double> &v) { return v.has_value() && *v != 0.0; }
-
-} // namespace
 
 // ------------------------------------------------------------------------------------------------
 // scan_gcode / LineInfo
@@ -131,79 +131,79 @@ bool LineInfo::has_xy() const { return py_hypot(x1 - x0, y1 - y0) > 1e-9; }
 
 bool LineInfo::is_extruding_move() const { return is_motion && ! is_arc && de > EPS_E && has_xy(); }
 
+LineInfo GCodeScanner::step(const std::string &raw)
+{
+    std::string s = raw;
+    while (! s.empty() && (s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    const size_t ci = s.find(';');
+    const std::string code    = strip(ci != std::string::npos ? s.substr(0, ci) : s);
+    const std::string comment = ci != std::string::npos ? s.substr(ci + 1) : std::string();
+    LineInfo li;
+    if (! comment.empty()) {
+        if (std::optional<std::string> t = match_type(comment))
+            ftype = *t;
+        else if (std::optional<double> w = match_key_number(comment, "WIDTH"))
+            width = *w;
+        else if (std::optional<double> h = match_key_number(comment, "HEIGHT"))
+            li.height_here = *h;
+    }
+    li.cmd = cmd_of(code);
+    li.x0 = x; li.y0 = y; li.z0 = z;
+    const std::string &cmd = li.cmd;
+    if (cmd == "G0" || cmd == "G1" || cmd == "G2" || cmd == "G3") {
+        li.is_motion = true;
+        li.is_arc    = cmd == "G2" || cmd == "G3";
+        const WordMatch mx = find_word(code, "X"), my = find_word(code, "Y"), mz = find_word(code, "Z");
+        if (mx) x = absxyz ? mx.value : x + mx.value;
+        if (my) y = absxyz ? my.value : y + my.value;
+        if (mz) z = absxyz ? mz.value : z + mz.value;
+        if (const WordMatch me = find_word(code, "E")) {
+            li.has_e_word = true;
+            if (rel)
+                li.de = me.value;
+            else {
+                li.de = me.value - e;
+                e     = me.value;
+            }
+        }
+        if (const WordMatch mf = find_word(code, "F"))
+            feed = mf.value;
+    } else if (cmd == "G92") {
+        if (const WordMatch me = find_word(code, "E")) {
+            li.has_e_word = true;
+            e = me.value;
+        }
+        if (const WordMatch m = find_word(code, "X")) x = m.value;
+        if (const WordMatch m = find_word(code, "Y")) y = m.value;
+        if (const WordMatch m = find_word(code, "Z")) z = m.value;
+    } else if (cmd == "M82")
+        rel = false;
+    else if (cmd == "M83")
+        rel = true;
+    else if (cmd == "G90")
+        absxyz = true;
+    else if (cmd == "G91")
+        absxyz = false;
+    else if (cmd == "G28")
+        x = y = z = 0.;
+    li.x1 = x; li.y1 = y; li.z1 = z;
+    li.e_after   = e;
+    li.rel_after = rel;
+    li.relxyz    = ! absxyz;
+    li.feed      = feed;
+    li.ftype     = ftype;
+    li.width     = width;
+    return li;
+}
+
 std::vector<LineInfo> scan_gcode(const std::vector<std::string> &lines)
 {
     std::vector<LineInfo> infos;
     infos.reserve(lines.size());
-    double x = 0., y = 0., z = 0., e = 0.;
-    bool   rel = false, absxyz = true;
-    double feed = 1200.;
-    std::string ftype;
-    std::optional<double> width;
-    for (const std::string &raw : lines) {
-        std::string s = raw;
-        while (! s.empty() && (s.back() == '\r' || s.back() == '\n'))
-            s.pop_back();
-        const size_t ci = s.find(';');
-        const std::string code    = strip(ci != std::string::npos ? s.substr(0, ci) : s);
-        const std::string comment = ci != std::string::npos ? s.substr(ci + 1) : std::string();
-        LineInfo li;
-        if (! comment.empty()) {
-            if (std::optional<std::string> t = match_type(comment))
-                ftype = *t;
-            else if (std::optional<double> w = match_key_number(comment, "WIDTH"))
-                width = *w;
-            else if (std::optional<double> h = match_key_number(comment, "HEIGHT"))
-                li.height_here = *h;
-        }
-        li.cmd = cmd_of(code);
-        li.x0 = x; li.y0 = y; li.z0 = z;
-        const std::string &cmd = li.cmd;
-        if (cmd == "G0" || cmd == "G1" || cmd == "G2" || cmd == "G3") {
-            li.is_motion = true;
-            li.is_arc    = cmd == "G2" || cmd == "G3";
-            const WordMatch mx = find_word(code, "X"), my = find_word(code, "Y"), mz = find_word(code, "Z");
-            if (mx) x = absxyz ? mx.value : x + mx.value;
-            if (my) y = absxyz ? my.value : y + my.value;
-            if (mz) z = absxyz ? mz.value : z + mz.value;
-            if (const WordMatch me = find_word(code, "E")) {
-                li.has_e_word = true;
-                if (rel)
-                    li.de = me.value;
-                else {
-                    li.de = me.value - e;
-                    e     = me.value;
-                }
-            }
-            if (const WordMatch mf = find_word(code, "F"))
-                feed = mf.value;
-        } else if (cmd == "G92") {
-            if (const WordMatch me = find_word(code, "E")) {
-                li.has_e_word = true;
-                e = me.value;
-            }
-            if (const WordMatch m = find_word(code, "X")) x = m.value;
-            if (const WordMatch m = find_word(code, "Y")) y = m.value;
-            if (const WordMatch m = find_word(code, "Z")) z = m.value;
-        } else if (cmd == "M82")
-            rel = false;
-        else if (cmd == "M83")
-            rel = true;
-        else if (cmd == "G90")
-            absxyz = true;
-        else if (cmd == "G91")
-            absxyz = false;
-        else if (cmd == "G28")
-            x = y = z = 0.;
-        li.x1 = x; li.y1 = y; li.z1 = z;
-        li.e_after   = e;
-        li.rel_after = rel;
-        li.relxyz    = ! absxyz;
-        li.feed      = feed;
-        li.ftype     = ftype;
-        li.width     = width;
-        infos.push_back(std::move(li));
-    }
+    GCodeScanner scanner;
+    for (const std::string &raw : lines)
+        infos.push_back(scanner.step(raw));
     return infos;
 }
 
@@ -240,39 +240,65 @@ std::vector<LayerChunk> split_layers(const std::vector<std::string> &lines, cons
     if (cfg_start_out)
         *cfg_start_out = cfg_start;
     std::vector<LayerChunk> chunks;
-    std::optional<LayerChunk> cur;
-    for (size_t i = 0; i < cfg_start; ++i) {
-        const LineInfo &li = infos[i];
-        if (is_layer_start(lines[i]) && (! cur || cur->n_extruding > 0)) {
-            if (cur) {
-                cur->end = i;
-                chunks.push_back(std::move(*cur));
-            }
-            cur.emplace();
-            cur->index = int(chunks.size()) + 1;
-            cur->start = i;
-            cur->end   = cfg_start;
-        }
-        if (! cur)
-            continue;
-        if (li.relxyz)
-            cur->has_relxyz = true;
-        if (li.is_motion && li.is_arc && li.de > EPS_E)
-            cur->has_arc = true;
-        if (li.height_here && ! cur->height)
-            cur->height = li.height_here;
-        if (li.is_extruding_move()) {
-            ++cur->n_extruding;
-            cur->types.insert(li.ftype);
-            if (! cur->z)
-                cur->z = li.z1;
-        }
-    }
-    if (cur) {
-        cur->end = cfg_start;
-        chunks.push_back(std::move(*cur));
-    }
+    ChunkTracker tracker;
+    for (size_t i = 0; i < cfg_start; ++i)
+        if (tracker.step(i, lines[i], infos[i]) == ChunkTracker::opened)
+            if (std::optional<LayerChunk> c = tracker.take_closed())
+                chunks.push_back(std::move(*c));
+    if (std::optional<LayerChunk> c = tracker.finish(cfg_start))
+        chunks.push_back(std::move(*c));
     return chunks;
+}
+
+ChunkTracker::Ev ChunkTracker::step(size_t i, const std::string &line, const LineInfo &li)
+{
+    Ev ev = none;
+    if (is_layer_start(line) && (! m_cur || m_cur->n_extruding > 0)) {
+        if (m_cur) {
+            m_cur->end = i;
+            m_closed.push_back(std::move(*m_cur));
+        }
+        m_cur.emplace();
+        m_cur->index = ++m_n_opened;
+        m_cur->start = i;
+        ev = opened;
+    }
+    if (! m_cur)
+        return ev;
+    LayerChunk *cur = &*m_cur;
+    cur->end = i + 1;
+    if (li.relxyz)
+        cur->has_relxyz = true;
+    if (li.is_motion && li.is_arc && li.de > EPS_E)
+        cur->has_arc = true;
+    if (li.height_here && ! cur->height)
+        cur->height = li.height_here;
+    if (li.is_extruding_move()) {
+        ++cur->n_extruding;
+        cur->types.insert(li.ftype);
+        if (! cur->z)
+            cur->z = li.z1;
+    }
+    return ev;
+}
+
+std::optional<LayerChunk> ChunkTracker::take_closed()
+{
+    if (m_closed.empty())
+        return std::nullopt;
+    LayerChunk c = std::move(m_closed.front());
+    m_closed.erase(m_closed.begin());
+    return c;
+}
+
+std::optional<LayerChunk> ChunkTracker::finish(size_t end)
+{
+    if (! m_cur)
+        return std::nullopt;
+    LayerChunk c = std::move(*m_cur);
+    m_cur.reset();
+    c.end = end;
+    return c;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -311,6 +337,7 @@ LayerModel parse_core_layer(const std::vector<std::string> &lines, const std::ve
                 cur->seg_de.push_back(li.de);
                 cur->seg_feed.push_back(li.feed);
                 cur->seg_raw.push_back(lines[i]);
+                cur->seg_width.push_back(truthy(li.width) ? *li.width : width_fallback);
                 if (! m.z)
                     m.z = li.z1;
             } else {

@@ -54,6 +54,24 @@ struct LineInfo
     bool is_extruding_move() const;     // straight G0/G1 that deposits paste while moving in XY
 };
 
+// Python truthiness of an Optional[float]: None and 0.0 are false.
+bool truthy(const std::optional<double> &v);
+
+// Streaming form of scan_gcode: one line at a time, in file order. Its state is the modal state of the
+// scan (position, E, M82/M83, G90/G91, feed, ;TYPE:, ;WIDTH:). scan_gcode is step() over every line.
+class GCodeScanner
+{
+public:
+    LineInfo step(const std::string &raw);
+
+private:
+    double x = 0., y = 0., z = 0., e = 0.;
+    bool   rel = false, absxyz = true;
+    double feed = 1200.;
+    std::string ftype;
+    std::optional<double> width;
+};
+
 std::vector<LineInfo> scan_gcode(const std::vector<std::string> &lines);
 
 // v2 _RE_LAYER_START.match: ^\s*;\s*(?:LAYER_CHANGE\b|LAYER\s*:\s*\d+), case-insensitive.
@@ -70,6 +88,28 @@ struct LayerChunk
     bool   has_arc = false, has_relxyz = false;
 };
 
+// Streaming form of split_layers over the lines before "; CONFIG_BLOCK_START" (the caller stops feeding
+// there). A chunk opens at a layer-start line iff no chunk is open or the open one has an extruding move.
+// step(i, line, li) is called for line i with li = its LineInfo. When it returns `opened`, the previous
+// chunk (if any) was closed with end = i and is available from take_closed(); current() is the new chunk,
+// which already contains line i. While a chunk is open, current()->end is i + 1 of the last line fed.
+// finish(end) closes the open chunk with that end and returns it.
+class ChunkTracker
+{
+public:
+    enum Ev { none, opened };
+    Ev          step(size_t i, const std::string &line, const LineInfo &li);
+    LayerChunk *current() { return m_cur ? &*m_cur : nullptr; }
+    std::optional<LayerChunk> take_closed();
+    std::optional<LayerChunk> finish(size_t end);
+    int         n_opened() const { return m_n_opened; }
+
+private:
+    std::optional<LayerChunk> m_cur;
+    std::vector<LayerChunk>   m_closed;   // closed and not yet taken, oldest first
+    int                       m_n_opened = 0;
+};
+
 // v2 split_layers: the part before "; CONFIG_BLOCK_START" split at ;LAYER_CHANGE / ;LAYER:<n>.
 std::vector<LayerChunk> split_layers(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos,
                                      size_t *cfg_start = nullptr);
@@ -82,6 +122,9 @@ struct PathRec
     std::vector<std::pair<double, double>> points;
     std::vector<double> seg_de, seg_feed;
     std::vector<std::string> seg_raw;   // empty for a synthetic (fallback) path
+    // ;WIDTH: of each segment (the width rule of the path's first segment, applied per segment). v2 has no such
+    // field and uses `width` (the first segment's) for the whole path; the native planner also uses this.
+    std::vector<double> seg_width;
     double width = 0, z = 0;
     std::vector<size_t> pre_lines;
     std::optional<double> travel_feed;

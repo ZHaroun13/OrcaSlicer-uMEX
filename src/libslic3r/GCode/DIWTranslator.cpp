@@ -245,7 +245,11 @@ bool get_bool(const DynamicPrintConfig &c, const char *key, bool def)
     return def;
 }
 
-Params read_params(const DynamicPrintConfig &c)
+} // namespace
+
+// Exported for the native powder planner (PLANNER_DESIGN.md section 2.2), so that U, plan_fingerprint(U) and
+// the feeds it uses are exactly the translator's.
+DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &c)
 {
     Params p;
     p.a_mode = diwaFlowScaled;
@@ -287,6 +291,8 @@ Params read_params(const DynamicPrintConfig &c)
     }
     return p;
 }
+
+namespace {
 
 // ------------------------------------------------------------------------------------------------
 // Translator (DIWPostProcessor)
@@ -840,7 +846,7 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
     if (! lines.empty() && starts_with(lines.front(), DIW_TRANSLATION_HEADER))
         return gcode; // already translated
 
-    const Params p = read_params(config);
+    const Params p = diw_read_translator_params(config);
     std::vector<DIW::PlacedBlock> blocks;
     if (p.umex) {
         // A record error stops the export: the planner and the translator disagree about the file.

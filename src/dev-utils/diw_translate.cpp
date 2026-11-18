@@ -19,11 +19,22 @@
 //                               parse the records and print write_block() of every accepted block
 //   diw_translate [--config-from-gcode] --fingerprint <in.gcode> [key=value ...]
 //                               print the plan fingerprint string and its 8-digit hex, one per line
+//   diw_translate --plan-json <in.json> <out.txt> <debug.json>
+//                               run the native powder planner (GCode/DIWPowderPlanner, PLANNER_DESIGN.md
+//                               section 7) on PlanInput JSON (one case, or {"cases": [...]}); writes the record
+//                               block of every case to out.txt and the cavity / Omega / narrow / revert WKT and
+//                               the per-component hatch data to debug.json (diw/tests/compare_planner.py)
+//   diw_translate [--config-from-gcode] --plan-records [--feed-size N] <in.gcode> <out.gcode> [key=value ...]
+//                               offline shadow binder (PLANNER_DESIGN.md section 9): writes in.gcode with the
+//                               native ";DIW:" record blocks inserted (text-only adapter, or native captures
+//                               reloaded from ORCA_DIW_SHADOW_DUMP); summary and warnings on stderr
 // Records output goes to stdout in binary mode (LF only).
 // Exit codes: 0 ok, 1 I/O or other error, 2 usage, 3 invalid u-MEX settings (DIWConfigError).
 
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/GCode/DIWPowderBlock.hpp"
+#include "libslic3r/GCode/DIWPowderPlanner.hpp"
+#include "libslic3r/GCode/DIWPowderShadow.hpp"
 #include "libslic3r/GCode/DIWPyCompat.hpp"
 #include "libslic3r/GCode/DIWTranslator.hpp"
 #include "libslic3r/GCode/DIWUMexParams.hpp"
@@ -32,6 +43,10 @@
 #include <boost/nowide/fstream.hpp>
 #include <boost/nowide/iostream.hpp>
 
+#include <nlohmann/json.hpp>
+
+#include <charconv>
+#include <limits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -146,11 +161,218 @@ static std::string trim_ascii(const std::string &s)
     return s.substr(b, s.find_last_not_of(ws) - b + 1);
 }
 
+// ------------------------------------------------------------------------------------------------ --plan-json
+
+// A JSON number, or a string holding Python repr() of a float (parsed with a correctly rounded parser, so the
+// value is exactly Python's).
+static double jnum(const nlohmann::json &j)
+{
+    if (j.is_string()) {
+        const std::string s = j.get<std::string>();
+        double            v = 0.;
+        const auto        r = std::from_chars(s.data(), s.data() + s.size(), v, std::chars_format::general);
+        if (r.ec != std::errc() || r.ptr != s.data() + s.size()) {
+            if (s == "inf") return std::numeric_limits<double>::infinity();
+            if (s == "-inf") return -std::numeric_limits<double>::infinity();
+            throw std::runtime_error("bad number in plan JSON: " + s);
+        }
+        return v;
+    }
+    return j.get<double>();
+}
+
+static std::vector<Vec2d> jpts_mm(const nlohmann::json &j)
+{
+    std::vector<Vec2d> out;
+    for (const auto &p : j) out.emplace_back(jnum(p.at(0)), jnum(p.at(1)));
+    return out;
+}
+
+static Points jpts_nm(const nlohmann::json &j)
+{
+    Points out;
+    for (const auto &p : j) out.emplace_back(coord_t(p.at(0).get<long long>()), coord_t(p.at(1).get<long long>()));
+    return out;
+}
+
+static std::vector<DIW::TextPath> jtext(const nlohmann::json &c, const char *key)
+{
+    std::vector<DIW::TextPath> out;
+    if (! c.contains(key))
+        return out;
+    for (const auto &j : c.at(key)) {
+        DIW::TextPath t;
+        t.ptype  = j.value("ptype", std::string());
+        t.kind   = j.value("kind", std::string());
+        t.pts_mm = jpts_mm(j.at("pts"));
+        for (const Vec2d &v : t.pts_mm) t.pts_nm.points.push_back(DIW::to_grid(v));
+        for (const auto &v : j.at("seg_de")) t.seg_de.push_back(jnum(v));
+        for (const auto &v : j.at("seg_feed")) t.seg_feed.push_back(jnum(v));
+        if (j.contains("seg_width"))
+            for (const auto &v : j.at("seg_width")) t.seg_width.push_back(jnum(v));
+        t.width = jnum(j.at("width"));
+        t.z     = jnum(j.at("z"));
+        if (j.contains("travel_feed") && ! j.at("travel_feed").is_null())
+            t.travel_feed = jnum(j.at("travel_feed"));
+        out.push_back(std::move(t));
+    }
+    return out;
+}
+
+static std::string wkt(const ExPolygons &ee)
+{
+    if (ee.empty())
+        return "MULTIPOLYGON EMPTY";
+    auto ring = [](const Points &pts) {
+        std::string s = "(";
+        for (size_t i = 0; i <= pts.size(); ++i) {
+            const Point &p = pts[i % pts.size()];
+            if (i) s += ", ";
+            s += DIW::py_repr(double(p.x()) * 1e-6) + " " + DIW::py_repr(double(p.y()) * 1e-6);
+        }
+        return s + ")";
+    };
+    std::string s = "MULTIPOLYGON (";
+    for (size_t k = 0; k < ee.size(); ++k) {
+        if (k) s += ", ";
+        s += "(" + ring(ee[k].contour.points);
+        for (const Polygon &h : ee[k].holes) s += ", " + ring(h.points);
+        s += ")";
+    }
+    return s + ")";
+}
+
+static int plan_json_mode(const std::string &in_path, const std::string &out_path, const std::string &dbg_path)
+{
+    std::string text;
+    if (! read_file(in_path, text))
+        return 1;
+    const nlohmann::json root = nlohmann::json::parse(text);
+    std::vector<nlohmann::json> cases;
+    if (root.contains("cases"))
+        for (const auto &c : root.at("cases")) cases.push_back(c);
+    else
+        cases.push_back(root);
+    std::string    blocks;
+    nlohmann::json dbg_cases = nlohmann::json::array();
+    for (const nlohmann::json &c : cases) {
+        nlohmann::json d;
+        d["k"] = c.value("k", 1);
+        try {
+            DIW::UMexParams U;
+            const auto &ju   = c.at("U");
+            U.delta          = jnum(ju.at("delta"));
+            U.hatch_angle    = jnum(ju.at("hatch_angle"));
+            U.point_len      = jnum(ju.at("point_len"));
+            U.rho_tap        = jnum(ju.at("rho_tap"));
+            U.eta            = jnum(ju.at("eta"));
+            U.m_dot          = jnum(ju.at("m_dot"));
+            U.paste_min_area = jnum(ju.at("paste_min_area"));
+            U.width_fallback = jnum(ju.at("width_fallback"));
+            DIW::PlanInput in;
+            in.U     = &U;
+            in.h     = jnum(c.at("h"));
+            in.s_eff = jnum(c.at("s_eff"));
+            if (c.contains("rings"))
+                for (const auto &r : c.at("rings")) in.rings.push_back({ Polygon(jpts_nm(r)) });
+            if (c.contains("open_outer"))
+                for (const auto &r : c.at("open_outer")) in.open_outer.push_back(jpts_mm(r));
+            if (c.contains("native_walls"))
+                for (const auto &w : c.at("native_walls"))
+                    in.native_walls.push_back({ Polyline(jpts_nm(w.at("pts"))), jnum(w.at("width")), w.value("closed", false) });
+            in.text_walls  = jtext(c, "text_walls");
+            in.text_paste  = jtext(c, "text_paste");
+            in.text_powder = jtext(c, "text_powder");
+            DIW::PlanDebug     dbg;
+            DIW::PowderLayerRec rec = DIW::plan_powder_layer_native(in, &dbg);
+            rec.k  = c.value("k", 1);
+            rec.z  = jnum(c.value("z", nlohmann::json(0.0)));
+            rec.h  = in.h;
+            rec.s  = in.s_eff;
+            rec.F  = jnum(c.value("F", nlohmann::json(0.0)));
+            rec.fu = jnum(c.value("fu", nlohmann::json(0.0)));
+            rec.fp = uint32_t(c.value("fp", 0LL));
+            blocks += DIW::write_block(rec);
+            d["error"]  = nullptr;
+            d["cavity"] = wkt(dbg.cavity);
+            d["omega"]  = wkt(dbg.omega);
+            d["narrow"] = wkt(dbg.narrow);
+            d["revert"] = wkt(dbg.revert);
+            nlohmann::json comps = nlohmann::json::array();
+            for (const DIW::PlanComponent &pc : dbg.components)
+                comps.push_back({ { "rows", pc.rows }, { "H", DIW::py_repr(pc.H) }, { "runs", pc.runs },
+                                  { "point", pc.point }, { "total", DIW::py_repr(pc.total) } });
+            d["components"] = comps;
+            d["notes"]      = dbg.notes;
+        } catch (const std::exception &ex) {
+            d["error"] = std::string(ex.what());
+        }
+        dbg_cases.push_back(d);
+    }
+    {
+        boost::nowide::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        f.write(blocks.data(), std::streamsize(blocks.size()));
+        if (! f) return 1;
+    }
+    const std::string dj = nlohmann::json{ { "cases", dbg_cases } }.dump();
+    boost::nowide::ofstream f(dbg_path, std::ios::binary | std::ios::trunc);
+    f.write(dj.data(), std::streamsize(dj.size()));
+    return f ? 0 : 1;
+}
+
+// ------------------------------------------------------------------------------------------------ --plan-records
+
+// Offline binder (PLANNER_DESIGN.md section 9): the shadow binder over a finished G-code file, fed in pieces of
+// feed_size bytes. Existing ";DIW:" record lines are removed first (as the translator does). Chunks without
+// placeholders use the text-only adapter; with placeholders, the native captures are reloaded from
+// ORCA_DIW_SHADOW_DUMP when it is set. The summary and the warnings go to stderr.
+static int plan_records_mode(const std::string &in_path, const std::string &out_path, const DynamicPrintConfig &cfg, size_t feed_size)
+{
+    std::string raw;
+    if (! read_file(in_path, raw))
+        return 1;
+    std::string in;
+    in.reserve(raw.size());
+    for (size_t pos = 0; pos < raw.size();) {
+        const size_t nl  = raw.find('\n', pos);
+        const size_t end = nl == std::string::npos ? raw.size() : nl + 1;
+        if (raw.compare(pos, 5, ";DIW:") != 0)
+            in.append(raw, pos, end - pos);
+        pos = end;
+    }
+    const DIW::TranslatorParams p = diw_read_translator_params(cfg);
+    if (! p.umex) {
+        boost::nowide::cerr << "--plan-records needs a u-MEX powder job (diw_powder_infill=1)\n";
+        return 2;
+    }
+    DIW::ShadowOptions o = DIW::ShadowOptions::from_env();
+    o.text_only          = true;
+    if (const auto *hp = cfg.option<ConfigOptionBool>("high_precision_gcode"); hp != nullptr && hp->value)
+        o.xy_decimals = 4;
+    DIW::PowderShadow sh(p, o);
+    if (! o.dump_dir.empty() && in.find(";DIWP ") != std::string::npos)
+        boost::nowide::cerr << "reloaded " << sh.load_dump_dir(o.dump_dir) << " native capture(s) from " << o.dump_dir << "\n";
+    std::string out;
+    out.reserve(in.size() + in.size() / 4);
+    const auto sink = [&out](std::string_view s) { out.append(s.data(), s.size()); };
+    if (feed_size == 0)
+        feed_size = 1;
+    for (size_t pos = 0; pos < in.size(); pos += feed_size)
+        sh.feed(std::string_view(in).substr(pos, feed_size), sink);
+    sh.finish(sink);
+    boost::nowide::cerr << sh.summary() << "\n";
+    for (const std::string &w : sh.warnings()) boost::nowide::cerr << "warning: " << w << "\n";
+    boost::nowide::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+    f.write(out.data(), std::streamsize(out.size()));
+    return f ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     boost::nowide::args nowide_args(argc, argv);
     bool config_from_gcode = false;
-    enum class Mode { Translate, DumpRecords, RewriteRecords, Fingerprint } mode = Mode::Translate;
+    enum class Mode { Translate, DumpRecords, RewriteRecords, Fingerprint, PlanRecords } mode = Mode::Translate;
+    size_t feed_size = 65536;
     DIWTranslateOptions opts;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
@@ -159,6 +381,18 @@ int main(int argc, char **argv)
             return pyrepr_mode();
         if (a == "--pyhypot")
             return pyhypot_mode();
+        if (a == "--plan-json") {
+            if (i + 3 >= argc) {
+                boost::nowide::cerr << "usage: diw_translate --plan-json <in.json> <out.txt> <debug.json>\n";
+                return 2;
+            }
+            try {
+                return plan_json_mode(argv[i + 1], argv[i + 2], argv[i + 3]);
+            } catch (const std::exception &ex) {
+                boost::nowide::cerr << "error: " << ex.what() << "\n";
+                return 1;
+            }
+        }
         if (a == "--config-from-gcode")
             config_from_gcode = true;
         else if (a == "--allow-unconverted-powder")
@@ -171,6 +405,10 @@ int main(int argc, char **argv)
             mode = Mode::RewriteRecords;
         else if (a == "--fingerprint")
             mode = Mode::Fingerprint;
+        else if (a == "--plan-records")
+            mode = Mode::PlanRecords;
+        else if (a == "--feed-size" && i + 1 < argc)
+            feed_size = size_t(std::stoull(argv[++i]));
         else
             args.push_back(a);
     }
@@ -206,6 +444,16 @@ int main(int argc, char **argv)
             return write_stdout(DIW::fingerprint_string(U) + "\n" + DIW::hex8(DIW::plan_fingerprint(U)) + "\n");
         }
 
+        if (mode == Mode::PlanRecords) {
+            if (args.size() < 2) {
+                boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] --plan-records [--feed-size N] <in.gcode> <out.gcode> [key=value ...]\n";
+                return 2;
+            }
+            DynamicPrintConfig cfg;
+            if (! build_config(cfg, args[0], config_from_gcode, std::vector<std::string>(args.begin() + 2, args.end())))
+                return 2;
+            return plan_records_mode(args[0], args[1], cfg, feed_size);
+        }
         if (args.size() < 2) {
             boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] [--allow-unconverted-powder] [--stub-powder-stage] <in.gcode> <out.gcode> [key=value ...]\n";
             return 2;
