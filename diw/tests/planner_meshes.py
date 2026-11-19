@@ -14,6 +14,7 @@ Writes, in mm, each part standing on z = 0 and centred near the origin:
   two_a.stl, two_b.stl  14 x 10 x 7 and 10 x 12 x 7 boxes, the two parts of the two_objects plate
   box20.stl, tube_thin.stl, spike_a/b/c.stl  the review regressions (regress_review.py): a 20 mm cube, a tube
                 OD 12 / ID 9.6 (one bead), and three 30 mm tapered prisms (bases 6, 8, 5 mm), all 20 mm high
+  cube10.stl    a 10 mm cube, the short part of the increment-5 G4 tall_short plate (with cube25)
 The repo meshes tests/data/cube_with_hole.obj, cube_with_concave_hole.obj, overhang.obj and bridge.obj are used
 as they are and are not written here.
 """
@@ -161,6 +162,8 @@ def main(argv):
         "spike_a": prism([(-3.0, -15.0), (3.0, -15.0), (0.0, 15.0)], fan([(-3.0, -15.0), (3.0, -15.0), (0.0, 15.0)]), 20.0),
         "spike_b": prism([(-4.0, -15.0), (4.0, -15.0), (0.0, 15.0)], fan([(-4.0, -15.0), (4.0, -15.0), (0.0, 15.0)]), 20.0),
         "spike_c": prism([(-2.5, -15.0), (2.5, -15.0), (0.0, 15.0)], fan([(-2.5, -15.0), (2.5, -15.0), (0.0, 15.0)]), 20.0),
+        # increment 5 G4 (PRODUCT_DESIGN.md 8): the short part of the tall_short plate (cube25 + this 10 mm cube)
+        "cube10": box(10.0, 10.0, 10.0),
     }
     for name, tris in parts.items():
         write(os.path.join(out, name + ".stl"), tris, name)

@@ -3,16 +3,33 @@
 // marker of the layer k it names, nothing else changed) and runs the translator in powder mode on it.
 // Built inside libslic3r_tests with BUILD_TESTS, and in the stand-alone dev-utils target diw_planner_tests.
 
+// The stand-alone dev-utils target diw_planner_tests (the only one built with CATCH_CONFIG_FAST_COMPILE) links
+// libslic3r without a test main: the T13 Print cases pull in libslic3r's SVG code, so nanosvg is implemented here,
+// before any header includes it (libslic3r_tests.cpp does it in libslic3r_tests).
+#ifdef CATCH_CONFIG_FAST_COMPILE
+#define NANOSVG_IMPLEMENTATION
+#include "nanosvg/nanosvg.h"
+#endif
+
 #include <catch2/catch_test_macros.hpp>
 
+#include "libslic3r/Model.hpp"
+#include "libslic3r/Print.hpp"
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/GCode/DIWPowderBlock.hpp"
 #include "libslic3r/GCode/DIWPowderShadow.hpp"
 #include "libslic3r/GCode/DIWTranslator.hpp"
+#include "libslic3r/GCode/DIWUMexParams.hpp"
 #include "libslic3r/GCode/DIWUMexSequencer.hpp"
+#include "libslic3r/TriangleMesh.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
 #include <optional>
 #include <random>
 #include <string>
@@ -69,9 +86,9 @@ void square(std::string &s, double a, double b, const char *type)
     s += "G1 X" + f3(a) + " Y" + f3(a) + " E1.5\n";
 }
 
-Polyline sq_nm(double a, double b, double shift)
+Slic3r::Polyline sq_nm(double a, double b, double shift)
 {
-    Polyline p;
+    Slic3r::Polyline p;
     for (const auto &[x, y] : std::vector<std::pair<double, double>>{ { a, a }, { b, a }, { b, b }, { a, b } })
         p.points.push_back(to_grid(Vec2d(x + shift, y + shift)));
     return p;
@@ -93,7 +110,7 @@ Gen make(const std::vector<Lay> &layers, const std::string &footer = FOOTER)
             if (m == 1 && l.native) {
                 NativeLayer nl;
                 nl.native_core = true;
-                Polygon ring(sq_nm(10., 40., l.native_shift).points);
+                Slic3r::Polygon ring(sq_nm(10., 40., l.native_shift).points);
                 nl.rings.push_back({ ring });
                 nl.pieces.push_back({ sq_nm(10., 40., l.native_shift), 1.2, true });
                 nl.pieces.push_back({ sq_nm(11.2, 38.8, l.native_shift), 1.2, true });
@@ -581,16 +598,16 @@ TEST_CASE("T8 binder: placeholder-like custom G-code is ordinary text (review fi
 }
 
 namespace {
-Polygon circle_scaled(double cx, double cy, double r, int n = 256)
+Slic3r::Polygon circle_scaled(double cx, double cy, double r, int n = 256)
 {
-    Polygon p;
+    Slic3r::Polygon p;
     for (int i = 0; i < n; ++i) {
         const double a = 2. * M_PI * i / n;
         p.points.emplace_back(coord_t(scale_(cx + r * std::cos(a))), coord_t(scale_(cy + r * std::sin(a))));
     }
     return p;
 }
-Points loop_points(const Polygon &p)
+Points loop_points(const Slic3r::Polygon &p)
 {
     Points pts = p.points;
     pts.push_back(p.points.front());
@@ -649,7 +666,7 @@ TEST_CASE("Review fix 2: a single-bead closed wall bounds no cavity", "[diw_shad
     // A solid disc: the outer loop is a ring. An open single bead (classic thin wall line) is not.
     const Points c60 = loop_points(circle_scaled(0, 0, 5.3));
     CHECK(bead_bounds_slice({ BeadPath{ &c60, scale_(1.4) } }, ExPolygons{ ExPolygon(circle_scaled(0, 0, 6.0)) }));
-    Polygon strip;
+    Slic3r::Polygon strip;
     strip.points = { Point::new_scale(0., -0.5), Point::new_scale(20., -0.5), Point::new_scale(20., 0.5), Point::new_scale(0., 0.5) };
     const Points line{ Point::new_scale(0.5, 0.), Point::new_scale(10., 0.), Point::new_scale(19.5, 0.) };
     CHECK_FALSE(bead_bounds_slice({ BeadPath{ &line, scale_(1.0) } }, ExPolygons{ ExPolygon(strip) }));
@@ -664,7 +681,7 @@ TEST_CASE("Review fix 3: a paste segment wider than its path's first width is ex
     const UMexParams        &U   = p.U;
     PlanInput in;
     const std::vector<Vec2d> sq{ { 10, 10 }, { 50, 10 }, { 50, 50 }, { 10, 50 }, { 10, 10 } };
-    Polygon ring;
+    Slic3r::Polygon ring;
     for (size_t i = 0; i + 1 < sq.size(); ++i) ring.points.push_back(to_grid(sq[i]));
     in.rings.push_back({ ring });
     in.text_walls.push_back(text_path("outer wall", "wall", sq, 1.2));
@@ -695,4 +712,1375 @@ TEST_CASE("Review fix 3: a paste segment wider than its path's first width is ex
     REQUIRE(before.status == PowderLayerRec::Status::ok);
     CHECK(min_slack(before) < U.delta);
     CHECK(fixed.ca < before.ca);
+}
+
+// ------------------------------------------------------------------------------------------------ T13 (increment 5)
+// diw/PRODUCT_DESIGN.md section 8, T13: diw_validate per row of 6.2 (message equality with read_umex_params, opt_key
+// from the explicit table, the 1e-9 boundaries), the Print::validate rules of 6.1 / 6.3, the translator's v2_parity
+// on and off, the new no-plan message, and the strict default accepting st=small and the h <= 0 carrier.
+
+namespace {
+
+// Scalar or first element of a float option.
+void set_num(DynamicPrintConfig &cfg, const char *key, double v)
+{
+    ConfigOption *o = cfg.option(key);
+    REQUIRE(o != nullptr);
+    if (auto *f = dynamic_cast<ConfigOptionFloats *>(o))
+        f->values.assign(f->values.empty() ? 1 : f->values.size(), v);
+    else if (auto *i = dynamic_cast<ConfigOptionInt *>(o))
+        i->value = int(v);
+    else if (auto *fl = dynamic_cast<ConfigOptionFloat *>(o))
+        fl->value = v;
+    else
+        FAIL("unsupported option type for " << key);
+}
+
+// The DIWConfigError text read_umex_params gives for cfg ("" when it accepts it), and its warnings.
+std::pair<std::string, std::vector<std::string>> umex_result(const DynamicPrintConfig &cfg)
+{
+    std::string uv_on;
+    if (const auto *o = cfg.option<ConfigOptionString>("diw_uv_on_gcode"))
+        uv_on = o->value;
+    while (! uv_on.empty() && (uv_on.back() == ' ' || uv_on.back() == '\n')) uv_on.pop_back();
+    try {
+        return { std::string(), read_umex_params(cfg, uv_on).second };
+    } catch (const DIWConfigError &ex) {
+        return { ex.what(), {} };
+    }
+}
+
+// diw_validate(cfg) gives exactly read_umex_params' error with the table's opt_key `key`.
+void expect_error(const DynamicPrintConfig &cfg, const std::string &key, const std::string &prefix)
+{
+    const DIWValidation v = diw_validate(cfg);
+    const std::string   want = umex_result(cfg).first;
+    INFO("key " << key << ": " << v.error);
+    REQUIRE(! want.empty());
+    CHECK(v.error == want);
+    CHECK(v.error.rfind(prefix, 0) == 0);
+    CHECK(v.opt_key == key);
+    // the translator raises the same text
+    std::string tr;
+    try {
+        diw_read_translator_params(cfg);
+    } catch (const DIWConfigError &ex) {
+        tr = ex.what();
+    }
+    CHECK(tr == v.error);
+}
+
+void expect_no_error(const DynamicPrintConfig &cfg)
+{
+    const DIWValidation v = diw_validate(cfg);
+    INFO(v.error);
+    CHECK(v.error.empty());
+    CHECK(umex_result(cfg).first.empty());
+}
+
+bool has_warn(const DIWValidation &v, const std::string &prefix, const std::string &key)
+{
+    for (const auto &[m, k] : v.warnings)
+        if (m.rfind(prefix, 0) == 0)
+            return k == key;
+    return false;
+}
+
+bool any_warn(const DIWValidation &v, const std::string &prefix)
+{
+    for (const auto &[m, k] : v.warnings)
+        if (m.rfind(prefix, 0) == 0)
+            return true;
+    return false;
+}
+
+// Replaces the record block k of `text` by `block`.
+std::string replace_block(const std::string &text, int k, const std::string &block)
+{
+    const std::string tag = ";DIW:BEGIN v=1 k=" + std::to_string(k) + " ";
+    const size_t b = text.find(tag);
+    REQUIRE(b != std::string::npos);
+    const size_t e = text.find(";DIW:END", b);
+    REQUIRE(e != std::string::npos);
+    const size_t eol = text.find('\n', e);
+    return text.substr(0, b) + block + text.substr(eol + 1);
+}
+
+std::string translate_error(const std::string &text, const DynamicPrintConfig &cfg, const DIWTranslateOptions &o = DIWTranslateOptions())
+{
+    try {
+        diw_translate_gcode(text, cfg, o);
+    } catch (const DIWConfigError &ex) {
+        return ex.what();
+    }
+    return std::string();
+}
+
+} // namespace
+
+TEST_CASE("T13 diw_validate: opt_key table", "[diw_validate]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const auto &table = diw_validation_opt_key_table();
+    REQUIRE(table.size() == 18);
+    for (size_t i = 0; i < table.size(); ++i) {
+        INFO(table[i].first);
+        CHECK(cfg.has(table[i].second));
+        for (size_t j = 0; j < table.size(); ++j)
+            if (i != j)
+                CHECK(table[j].first.rfind(table[i].first, 0) != 0);   // no row is a prefix of another
+    }
+    CHECK(diw_validation_opt_key("no such message").empty());
+    // a valid powder job: no error; non-DIW and paste-only configs are never checked
+    const DIWValidation ok = diw_validate(cfg);
+    CHECK(ok.error.empty());
+    for (const auto &[m, k] : ok.warnings) {
+        INFO(m);
+        CHECK(! k.empty());
+    }
+    DynamicPrintConfig bad = make_cfg({ { "diw_compaction_time", "9" } });
+    CHECK(! diw_validate(bad).error.empty());
+    bad.set_key_value("diw_printer", new ConfigOptionBool(false));
+    CHECK(diw_validate(bad).error.empty());
+    CHECK(diw_validate(bad).warnings.empty());
+    DynamicPrintConfig paste = make_cfg({ { "diw_compaction_time", "9" }, { "diw_powder_infill", "0" } });
+    CHECK(diw_validate(paste).error.empty());
+    CHECK(diw_validate(paste).warnings.empty());
+}
+
+TEST_CASE("T13 diw_validate: hard limits of 6.2 with v2's messages", "[diw_validate]")
+{
+    auto with = [](const char *key, double v) {
+        DynamicPrintConfig c = make_cfg();
+        set_num(c, key, v);
+        return c;
+    };
+    // compaction_duration: > 8.0 and <= 0 are errors; < 1.0 a warning
+    expect_no_error(with("diw_compaction_time", 8.0));
+    expect_error(with("diw_compaction_time", std::nextafter(8.0, 9.0)), "diw_compaction_time", "compaction_duration = ");
+    expect_error(with("diw_compaction_time", 0.0), "diw_compaction_time", "compaction_duration must be > 0");
+    expect_error(with("diw_compaction_time", -1.0), "diw_compaction_time", "compaction_duration must be > 0");
+    CHECK(has_warn(diw_validate(with("diw_compaction_time", 0.999)), "compaction_duration = ", "diw_compaction_time"));
+    CHECK(! any_warn(diw_validate(with("diw_compaction_time", 1.0)), "compaction_duration = "));
+    // > 0
+    const std::pair<const char *, const char *> positive[] = {
+        { "diw_powder_hatch_spacing", "powder_hatch_spacing must be > 0" }, { "diw_powder_mass_flow", "powder_mass_flow_rate must be > 0" },
+        { "diw_powder_tap_density", "powder_tap_density must be > 0" },     { "diw_powder_fill_multiplier", "powder_fill_multiplier must be > 0" },
+        { "diw_powder_speed_max", "powder_f_max must be > 0" },             { "diw_powder_nozzle_diameter", "powder_nozzle_dia must be > 0" } };
+    for (const auto &[key, msg] : positive) {
+        expect_error(with(key, 0.0), key, msg);
+        expect_error(with(key, -0.5), key, msg);
+        expect_no_error(with(key, 1e-6));
+    }
+    // >= 0
+    const std::pair<const char *, const char *> non_negative[] = {
+        { "diw_powder_lag_on", "powder_lag_on must be >= 0" },               { "diw_powder_lag_off", "powder_lag_off must be >= 0" },
+        { "diw_shell_powder_clearance", "shell_powder_clearance must be >= 0" }, { "diw_compaction_settle_time", "compaction_settle_dwell must be >= 0" },
+        { "diw_powder_travel_hop", "powder_travel_hop_mm must be >= 0" },    { "diw_compaction_z_hop", "compaction_z_hop_mm must be >= 0" } };
+    for (const auto &[key, msg] : non_negative) {
+        expect_error(with(key, -1e-6), key, msg);
+        expect_no_error(with(key, 0.0));
+    }
+    // compaction_interval >= 1
+    expect_error(with("diw_compaction_interval", 0), "diw_compaction_interval", "compaction_interval must be >= 1");
+    expect_no_error(with("diw_compaction_interval", 1));
+    // voltage within [3.65 - 1e-9, 12 + 1e-9]; a warning off 3.65 by more than 1e-9
+    expect_no_error(with("diw_powder_motor_voltage", 3.65 - 0.5e-9));
+    expect_error(with("diw_powder_motor_voltage", 3.65 - 2e-9), "diw_powder_motor_voltage", "powder_motor_voltage must be within 3.65-12.0 V");
+    expect_no_error(with("diw_powder_motor_voltage", 12.0 + 0.5e-9));
+    expect_error(with("diw_powder_motor_voltage", 12.0 + 2e-9), "diw_powder_motor_voltage", "powder_motor_voltage must be within 3.65-12.0 V");
+    CHECK(! any_warn(diw_validate(with("diw_powder_motor_voltage", 3.65 + 0.5e-9)), "powder_motor_voltage = "));
+    CHECK(has_warn(diw_validate(with("diw_powder_motor_voltage", 3.65 + 2e-9)), "powder_motor_voltage = ", "diw_powder_motor_voltage"));
+    CHECK(has_warn(diw_validate(with("diw_powder_motor_voltage", 12.0)), "powder_motor_voltage = ", "diw_powder_motor_voltage"));
+    // digital outputs distinct (powder, compaction, UV-on P<n>)
+    {
+        DynamicPrintConfig c = make_cfg();
+        set_num(c, "diw_compaction_pin", c.opt_int("diw_powder_pin"));
+        expect_error(c, "diw_powder_pin", "digital output pins must be distinct: {'powder_pin': ");
+        DynamicPrintConfig u = make_cfg({ { "diw_uv_on_gcode", "M62 P5 Q1" } });
+        expect_error(u, "diw_powder_pin", "digital output pins must be distinct: {'powder_pin': ");
+        CHECK(diw_validate(u).error.find("'uv_on_cmd pin': 5}") != std::string::npos);
+        DynamicPrintConfig n = make_cfg({ { "diw_uv_on_gcode", "M62 P9 Q1" } });
+        expect_no_error(n);
+    }
+}
+
+TEST_CASE("T13 diw_validate: warnings of 6.2 and their 1e-9 boundaries", "[diw_validate]")
+{
+    // shell_powder_clearance < d_powder / 2 + 0.35 - 1e-9
+    {
+        DynamicPrintConfig c   = make_cfg();
+        const double       lim = c.opt_float("diw_powder_nozzle_diameter") / 2.0 + 0.35;
+        set_num(c, "diw_shell_powder_clearance", lim - 0.5e-9);
+        CHECK(! any_warn(diw_validate(c), "shell_powder_clearance = "));
+        set_num(c, "diw_shell_powder_clearance", lim - 2e-9);
+        CHECK(has_warn(diw_validate(c), "shell_powder_clearance = ", "diw_shell_powder_clearance"));
+        CHECK(diw_validate(c).error.empty());
+    }
+    // powder_z_clearance - powder_offset_z < -1e-9
+    {
+        DynamicPrintConfig c = make_cfg();
+        const double       zc = c.opt_float("diw_powder_z_clearance");
+        set_num(c, "diw_powder_offset_z", zc + 0.5e-9);
+        CHECK(! any_warn(diw_validate(c), "powder_offset_z = "));
+        set_num(c, "diw_powder_offset_z", zc + 2e-9);
+        CHECK(has_warn(diw_validate(c), "powder_offset_z = ", "diw_powder_offset_z"));
+    }
+    // all offsets 0 (translator warning), every warning text equal to read_umex_params' / the translator's
+    {
+        DynamicPrintConfig c = make_cfg({ { "diw_powder_offset_x", "0" }, { "diw_powder_offset_y", "0" }, { "diw_powder_offset_z", "0" } });
+        const DIWValidation v = diw_validate(c);
+        CHECK(has_warn(v, "POWDER NOZZLE OFFSETS powder_offset_x/y/z ARE ALL 0.0 (UNCALIBRATED)", "diw_powder_offset_x"));
+        const TranslatorParams p = diw_read_translator_params(c);
+        REQUIRE(v.warnings.size() == p.config_warnings.size());
+        for (size_t i = 0; i < v.warnings.size(); ++i) CHECK(v.warnings[i].first == p.config_warnings[i]);
+        set_num(c, "diw_powder_offset_x", 1.0);
+        CHECK(! any_warn(diw_validate(c), "POWDER NOZZLE OFFSETS"));
+    }
+}
+
+TEST_CASE("T13 translator: no-plan message, v2_parity on and off, strict accepts st=small and h <= 0", "[diw_validate]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    const Gen                g   = make(stack(5));
+    const Run                r   = run_binder(p, g);
+    const auto               bb  = check_released(r.out, g);
+    REQUIRE(ks_of(bb) == std::vector<int>{ 2, 3, 4 });
+    REQUIRE(bb[1].status == PowderLayerRec::Status::ok);
+    // no block in a powder job
+    {
+        const std::string want = "u-MEX powder infill: this G-code has no powder plan (;DIW: records). Export it again from "
+                                 "OrcaSlicer with u-MEX powder infill on; the plan is written during the export.";
+        CHECK(translate_error(strip_records(r.out), cfg) == want);
+        DIWTranslateOptions o;
+        o.allow_unconverted_powder = true;
+        CHECK(translate_error(strip_records(r.out), cfg, o).empty());
+        o.v2_parity = true;   // v2_parity does not relax it
+        o.allow_unconverted_powder = false;
+        CHECK(translate_error(strip_records(r.out), cfg, o) == want);
+    }
+    // a non-carrier st=open block at k=3
+    {
+        PowderLayerRec open = bb[1];
+        open.status = PowderLayerRec::Status::open;
+        open.ca = open.oa = open.ra = open.hl = 0.0;
+        open.nc = 0;
+        open.runs.clear();
+        open.fallbacks.clear();
+        const std::string text = replace_block(r.out, 3, write_block(open));
+        CHECK(translate_error(text, cfg) == "u-MEX powder records: layer 3 has no closed wall loop (st=open); this powder plan "
+                                            "cannot be printed. Export the G-code again from OrcaSlicer.");
+        DIWTranslateOptions o;
+        o.v2_parity = true;
+        std::string tr;
+        REQUIRE_NOTHROW(tr = diw_translate_gcode(text, cfg, o));
+        CHECK(tr.find("layer 3: wall loops could not be closed into a cavity; layer left as paste.") != std::string::npos);
+        CHECK(count_of(tr, " S1 paste contour ") == 2);
+        // parity off and on give the same output on a file without such a block
+        CHECK(diw_translate_gcode(r.out, cfg, o) == diw_translate_gcode(r.out, cfg));
+    }
+    // st=small at k=3: the strict default accepts it with v2's aggregated warning
+    {
+        PowderLayerRec small = bb[1];
+        small.status = PowderLayerRec::Status::small;
+        small.runs.clear();
+        small.fallbacks.clear();
+        const std::string text = replace_block(r.out, 3, write_block(small));
+        std::string tr;
+        REQUIRE_NOTHROW(tr = diw_translate_gcode(text, cfg));
+        CHECK(tr.find("1 core layer(s) (3-3) have no cavity region of inscribed radius >= shell_powder_clearance") != std::string::npos);
+        CHECK(count_of(tr, " S1 paste contour ") == 2);
+    }
+    // h <= 0 carrier: accepted by the strict default (also covered by the T8 case)
+    {
+        std::vector<Lay> v = stack(5);
+        v[2].z      = v[1].z;
+        v[2].height = "0";
+        const Gen  g0 = make(v);
+        const Run  r0 = run_binder(p, g0);
+        std::string tr;
+        REQUIRE_NOTHROW(tr = diw_translate_gcode(r0.out, cfg));
+        CHECK(tr.find("layer 3: non-positive layer height; left as paste.") != std::string::npos);
+    }
+}
+
+TEST_CASE("T13 extrusion_bbox: streaming equals the whole-file routine and stops at the config block", "[diw_validate]")
+{
+    const Gen g = make(stack(4));
+    std::vector<std::string> lines;
+    for (size_t pos = 0; pos < g.text.size();) {
+        const size_t nl  = g.text.find('\n', pos);
+        const size_t end = nl == std::string::npos ? g.text.size() : nl + 1;
+        lines.push_back(g.text.substr(pos, end - pos));
+        pos = end;
+    }
+    ExtrusionBBox a, b;
+    extrusion_bbox(lines, a);
+    for (const std::string &l : lines) extrusion_bbox(l, b);
+    CHECK(a.stopped);
+    CHECK(b.stopped);
+    CHECK((a.min_x == b.min_x && a.max_x == b.max_x && a.min_y == b.min_y && a.max_y == b.max_y));
+    CHECK(a.min_x == 10.0);
+    CHECK(a.max_x == 40.0);
+    CHECK(a.min_y == 10.0);
+    CHECK(a.max_y == 40.0);
+    ExtrusionBBox c = a;
+    extrusion_bbox(std::string("G1 X100 Y100 E5\n"), c);   // after the config block: ignored
+    CHECK(c.max_x == 40.0);
+    ExtrusionBBox none;
+    CHECK(none.empty());
+}
+
+namespace {
+
+struct Validated
+{
+    std::string                         error, opt_key;
+    std::vector<std::pair<std::string, std::string>> warnings;
+};
+
+// Print::validate of a 20 mm cube (or two) under cfg; per-object overrides on the first object.
+Validated validate_print(const DynamicPrintConfig &cfg, const std::vector<std::pair<std::string, std::string>> &obj0 = {},
+                         bool two = false, const std::vector<std::pair<std::string, std::string>> &obj1 = {})
+{
+    ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::Disable);
+    Model model;
+    ModelObject *o0 = model.add_object("cube", "", make_cube(20, 20, 20));
+    o0->add_instance()->set_offset(Vec3d(60., 60., 0.));
+    for (const auto &[k, v] : obj0) o0->config.set_deserialize(k, v, ctx);
+    if (two) {
+        ModelObject *o1 = model.add_object("cube2", "", make_cube(20, 20, 20));
+        o1->add_instance()->set_offset(Vec3d(120., 60., 0.));
+        for (const auto &[k, v] : obj1) o1->config.set_deserialize(k, v, ctx);
+    }
+    // Orca's own rule for the default relative E (G92 E0 in the layer G-code) is not under test here
+    DynamicPrintConfig c = cfg;
+    c.set_deserialize("layer_change_gcode", "G92 E0", ctx);
+    Print print;
+    print.apply(model, c);
+    std::vector<StringObjectException> warnings;
+    const StringObjectException err = print.validate(&warnings);
+    Validated r{ err.string, err.opt_key, {} };
+    for (const StringObjectException &w : warnings) r.warnings.emplace_back(w.string, w.opt_key);
+    return r;
+}
+
+bool has_print_warn(const Validated &v, const std::string &prefix, const std::string &key)
+{
+    for (const auto &[m, k] : v.warnings)
+        if (m.rfind(prefix, 0) == 0 && k == key)
+            return true;
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("T13 Print::validate: scarf, wall loops, sparse infill, infill combination, refusals, retraction warnings", "[diw_validate]")
+{
+    const DynamicPrintConfig base = make_cfg();
+    {
+        const Validated v = validate_print(base);
+        INFO(v.error);
+        CHECK(v.error.empty());
+    }
+    // 6.2 hard limit: the exact v2 message with the fork key
+    {
+        const Validated v = validate_print(make_cfg({ { "diw_compaction_time", "9" } }));
+        CHECK(v.error == "compaction_duration = 9.0 s exceeds the 8.0 s limit (requirements 4.4: Brazil-nut segregation)");
+        CHECK(v.opt_key == "diw_compaction_time");
+    }
+    // 6.1: global scarf forced off on a powder job (apply_diw_overrides), per-object scarf refused
+    {
+        const Validated g = validate_print(make_cfg({ { "seam_slope_type", "all" } }));
+        CHECK(g.error.empty());
+        const Validated o = validate_print(base, { { "seam_slope_type", "external" } });
+        CHECK(o.error == "u-MEX powder jobs cannot use a scarf joint seam: it ramps the outer wall below the layer and the powder "
+                         "cavity is planned on flat layers. Set \"Scarf joint seam\" to None in this object's settings.");
+        CHECK(o.opt_key == "seam_slope_type");
+        // a paste-only DIW job keeps its scarf
+        const Validated p = validate_print(make_cfg({ { "diw_powder_infill", "0" } }), { { "seam_slope_type", "external" } });
+        CHECK(p.error.empty());
+    }
+    // 6.3
+    {
+        const Validated w = validate_print(make_cfg({ { "wall_loops", "0" } }));
+        CHECK(w.error == "u-MEX powder infill needs at least one wall loop: the powder cavity is closed by the outer wall.");
+        CHECK(w.opt_key == "wall_loops");
+        const std::string dens = "u-MEX powder infill needs sparse infill: the powder replaces the sparse infill of the core layers. "
+                                 "Set a sparse infill density above 0 or turn u-MEX powder infill off.";
+        const Validated d = validate_print(make_cfg({ { "sparse_infill_density", "0%" } }));
+        CHECK(d.error == dens);
+        CHECK(d.opt_key == "sparse_infill_density");
+        const Validated d2 = validate_print(base, { { "sparse_infill_density", "0%" } }, true, { { "sparse_infill_density", "0%" } });
+        CHECK(d2.error == dens);
+        const Validated d1 = validate_print(base, { { "sparse_infill_density", "0%" } }, true);
+        CHECK(d1.error.empty());
+        const Validated c = validate_print(make_cfg({ { "infill_combination", "1" } }));
+        CHECK(c.error == "u-MEX powder jobs cannot combine infill: sparse infill printed every N layers would get the powder of one "
+                         "layer only. Turn \"Infill combination\" off.");
+        CHECK(c.opt_key == "infill_combination");
+        // the same values on a non-DIW printer and on a DIW paste-only job are not errors
+        for (const char *off : { "diw_printer", "diw_powder_infill" }) {
+            DynamicPrintConfig n = make_cfg({ { "wall_loops", "0" }, { "infill_combination", "1" }, { "diw_compaction_time", "9" } });
+            n.set_key_value(off, new ConfigOptionBool(false));
+            const Validated v = validate_print(n);
+            INFO(off << ": " << v.error);
+            CHECK(v.error.empty());
+        }
+    }
+    // structural refusals
+    {
+        const Validated s = validate_print(make_cfg({ { "spiral_mode", "1" }, { "wall_loops", "1" }, { "top_shell_layers", "0" },
+                                                       { "sparse_infill_density", "0%" } }));
+        CHECK(s.error == "u-MEX powder infill cannot be used with spiral vase mode.");
+        CHECK(s.opt_key == "spiral_mode");
+        CHECK(powder_refusal_reason(base, true, false, false) == "BBL printer G-code (the layer markers are in the BBL dialect)");
+        CHECK(powder_refusal_reason(base, false, false, true) == "G-code axis remap");
+        DynamicPrintConfig belt = make_cfg({ { "belt_printer", "1" } });
+        CHECK(powder_refusal_reason(belt, false, false, false) == "belt printer");
+        DynamicPrintConfig eo = make_cfg({ { "extruder_offset", "0x0,1x0" } });
+        CHECK(powder_refusal_reason(eo, false, false, false) == "extruders that have different extruder_offset values");
+        CHECK(powder_refusal_reason(base, false, false, false).empty());
+    }
+    // the three retraction warnings (paste and powder)
+    {
+        const Validated l = validate_print(make_cfg({ { "retraction_length", "6" }, { "diw_retraction_max_length", "5" },
+                                                       { "retraction_speed", "4" }, { "diw_retraction_max_speed", "5" } }));
+        CHECK(l.error.empty());
+        CHECK(has_print_warn(l, "Retractions of 6 mm are longer than the DIW limit of 5 mm (\"Maximum syringe retraction\"); "
+                                "the DIW translation may remove retractions longer than the limit, as v2 does.", "retraction_length"));
+        CHECK(! has_print_warn(l, "Retraction speed ", "retraction_speed"));
+        const Validated o = validate_print(make_cfg({ { "diw_retraction_enable", "0" }, { "retraction_length", "0.9" },
+                                                       { "diw_powder_infill", "0" } }));
+        CHECK(has_print_warn(o, "Syringe retraction is off on this DIW printer; the DIW translation removes retraction moves.",
+                             "retraction_length"));
+        const Validated sp = validate_print(make_cfg({ { "retraction_speed", "45" }, { "diw_retraction_max_speed", "5" } }));
+        CHECK(has_print_warn(sp, "Retraction speed 45 mm/s is clamped to the DIW limit of 5 mm/s.", "retraction_speed"));
+        // the 6.2 warnings reach Print::validate with their keys
+        CHECK(has_print_warn(sp, "POWDER NOZZLE OFFSETS", "diw_powder_offset_x"));
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+// T11 suppress_sparse (diw/PRODUCT_DESIGN.md 4.3 / 4.4 and section 8): the binder's text edit of an st=ok core chunk
+// and its V0-V3 verification, on hand-written chunks.
+// ------------------------------------------------------------------------------------------------
+
+namespace {
+
+std::vector<std::string> sup_split(const std::string &text)
+{
+    std::vector<std::string> lines;
+    for (size_t pos = 0; pos < text.size();) {
+        const size_t nl  = text.find('\n', pos);
+        const size_t end = nl == std::string::npos ? text.size() : nl + 1;
+        lines.push_back(text.substr(pos, end - pos));
+        pos = end;
+    }
+    return lines;
+}
+
+std::string sup_join(const std::vector<std::string> &lines)
+{
+    std::string s;
+    for (const std::string &l : lines) s += l;
+    return s;
+}
+
+struct Sup
+{
+    std::vector<std::string> lines;
+    std::vector<LineInfo>    infos;
+    LayerModel               model;
+    ScanState                before;
+    ExtrusionBBox            bb;
+    SuppressOutcome          out;
+};
+
+ScanState sup_before(double e, bool rel, double x = 0., double y = 0.)
+{
+    ScanState s;
+    s.e   = e;
+    s.rel = rel;
+    s.x   = x;
+    s.y   = y;
+    return s;
+}
+
+Sup sup_run(const std::string &text, const ScanState &before, SuppressMutate mut = SuppressMutate::none, bool skip_verify = false,
+            const std::function<bool(double, double)> &in_s = {})
+{
+    Sup s;
+    s.lines  = sup_split(text);
+    s.before = before;
+    GCodeScanner sc(before);
+    for (const std::string &l : s.lines) s.infos.push_back(sc.step(l));
+    LayerChunk lc;
+    lc.start = 0;
+    lc.end   = s.lines.size();
+    s.model  = parse_core_layer(s.lines, s.infos, lc, 0.45);
+    s.bb.found_first_layer = true;
+    s.bb.rel    = before.rel;
+    s.bb.prev_e = before.e;
+    s.bb.tx     = before.x;
+    s.bb.ty     = before.y;
+    s.out = suppress_and_verify(s.lines, s.infos, s.model, s.before, s.bb, 0.45, mut, skip_verify, in_s);
+    return s;
+}
+
+bool has_line(const std::vector<std::string> &lines, const std::string &l)
+{
+    return std::find(lines.begin(), lines.end(), l) != lines.end();
+}
+
+bool same_info(const LineInfo &a, const LineInfo &b)
+{
+    const auto bits = [](double u, double v) { return std::memcmp(&u, &v, sizeof u) == 0; };
+    return a.cmd == b.cmd && a.is_motion == b.is_motion && a.is_arc == b.is_arc && a.has_e_word == b.has_e_word &&
+           bits(a.x0, b.x0) && bits(a.y0, b.y0) && bits(a.z0, b.z0) && bits(a.x1, b.x1) && bits(a.y1, b.y1) && bits(a.z1, b.z1) &&
+           bits(a.de, b.de) && bits(a.e_after, b.e_after) && a.rel_after == b.rel_after && a.relxyz == b.relxyz &&
+           bits(a.feed, b.feed) && a.ftype == b.ftype && a.width.has_value() == b.width.has_value() &&
+           (! a.width || bits(*a.width, *b.width)) && a.height_here.has_value() == b.height_here.has_value();
+}
+
+// Walls then sparse infill last (absolute E unless rel).
+std::string chunk_walls_then_sparse(bool rel)
+{
+    std::string s = ";LAYER_CHANGE\n;Z:0.4\n;HEIGHT:0.2\n";
+    s += rel ? "M83\n" : "M82\n";
+    s += "G1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\nG1 F1200\n";
+    s += rel ? "G1 X20 Y10 E1\nG1 X20 Y20 E1\nG1 X10 Y20 E1\nG1 X10 Y10 E1\nG1 E-.8 F2400\nG1 X12 Y12 F9000\nG1 E.8 F2400\n"
+             : "G1 X20 Y10 E11\nG1 X20 Y20 E12\nG1 X10 Y20 E13\nG1 X10 Y10 E14\nG1 E13.2 F2400\nG1 X12 Y12 F9000\nG1 E14 F2400\n";
+    s += ";TYPE:Sparse infill\n;WIDTH:0.5\nG1 F1500\n";
+    s += rel ? "G1 X18 Y12 E.6\nG1 X18 Y14 E.2\nG1 X12 Y14 E.6\n" : "G1 X18 Y12 E14.6\nG1 X18 Y14 E14.8\nG1 X12 Y14 E15.4\n";
+    return s;
+}
+
+// Outer wall, sparse infill, inner wall with no travel after the sparse path (absolute E). `pre` goes into the
+// sparse path's pre_lines, `sparse` replaces its moves; without `travel` the chunk has no XY travel at all.
+std::string chunk_sparse_between(const std::string &pre = "", const std::string &sparse = "G1 X15 Y15 E12.5 F1500\nG1 X16 Y15 E12.6\n",
+                                 bool travel = true)
+{
+    std::string s = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\n";
+    if (travel)
+        s += "G1 X10 Y10 F9000\n";
+    s += ";TYPE:Outer wall\n;WIDTH:0.45\nG1 X20 Y10 E11 F1200\nG1 X20 Y20 E12\n";
+    s += ";TYPE:Sparse infill\n" + pre + sparse;
+    s += ";TYPE:Inner wall\nG1 X16 Y18 E12.9 F1100\nG1 X12 Y18 E13.3\n";
+    return s;
+}
+
+} // namespace
+
+TEST_CASE("T11 suppress_sparse: walls then sparse last, absolute E (G92 and end-of-chunk type restore)", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_walls_then_sparse(false), sup_before(10., false));
+    INFO(s.out.result.fallback << " " << s.out.detail);
+    REQUIRE(s.out.applied);
+    // the 16 kept lines, then the restore lines: R5 deferred before the kept "G1 F1500" (the removed ;TYPE: / ;WIDTH:
+    // lines hold no move), the kept "G1 F1500", and the end group R1 R2 R3 R4
+    std::vector<std::string> want(s.lines.begin(), s.lines.begin() + 16);
+    for (const char *l : { "G1 F2400 ;WIDTH:0.5\n", "G1 F1500\n", "G1 X12 Y14 F9000\n", "G1 F1500\n", "G92 E15.4\n",
+                           "G1 F1500 ;TYPE:Sparse infill\n" })
+        want.emplace_back(l);
+    CHECK(sup_join(s.out.result.lines) == sup_join(want));
+    CHECK(s.out.result.removed_moves == 3);
+    CHECK(s.out.result.removed_other == 2);
+    CHECK(s.out.result.restore_lines == 5);
+    CHECK(std::abs(s.out.result.removed_de - 1.4) < 1e-9);
+    REQUIRE(s.model.paths.size() == 2);
+    CHECK(s.model.paths[1].kind == "powder");
+    CHECK(s.model.paths[1].seg_lines == std::vector<size_t>{ 19, 20, 21 });
+    CHECK(s.model.paths[0].seg_lines == std::vector<size_t>{ 9, 10, 11, 12 });
+}
+
+TEST_CASE("T11 suppress_sparse: relative E needs no G92", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_walls_then_sparse(true), sup_before(0., false));
+    INFO(s.out.result.fallback << " " << s.out.detail);
+    REQUIRE(s.out.applied);
+    std::vector<std::string> want(s.lines.begin(), s.lines.begin() + 16);
+    for (const char *l : { "G1 F2400 ;WIDTH:0.5\n", "G1 F1500\n", "G1 X12 Y14 F9000\n", "G1 F1500\n", "G1 F1500 ;TYPE:Sparse infill\n" })
+        want.emplace_back(l);
+    CHECK(sup_join(s.out.result.lines) == sup_join(want));
+    for (const std::string &l : s.out.result.lines) CHECK(l.rfind("G92", 0) != 0);
+}
+
+TEST_CASE("T11 suppress_sparse: sparse between two wall paths, no travel after it (R1 with the previous trav_f)", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_sparse_between(), sup_before(10., false));
+    INFO(s.out.result.fallback << " " << s.out.detail);
+    REQUIRE(s.out.applied);
+    const std::string want = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\nG1 X20 Y10 E11 F1200\n"
+                             "G1 X20 Y20 E12\nG1 X16 Y15 F9000\nG1 F1500\nG92 E12.6\n;TYPE:Inner wall\nG1 X16 Y18 E12.9 F1100\n"
+                             "G1 X12 Y18 E13.3\n";
+    CHECK(sup_join(s.out.result.lines) == want);
+}
+
+TEST_CASE("T11 suppress_sparse: M204 / M106 in the sparse pre_lines are removed", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_sparse_between("M204 S500\nM106 S128\n"), sup_before(10., false));
+    INFO(s.out.result.fallback << " " << s.out.detail);
+    REQUIRE(s.out.applied);
+    CHECK(s.out.result.removed_other == 3);
+    CHECK(s.out.result.removed_moves == 2);
+    CHECK(! has_line(s.out.result.lines, "M204 S500\n"));
+    CHECK(! has_line(s.out.result.lines, "M106 S128\n"));
+}
+
+TEST_CASE("T11 suppress_sparse: object labels in the sparse pre_lines fall back (label_in_sparse)", "[diw_suppress]")
+{
+    for (const char *label : { "; start printing object, unique label id: 1\n", "; stop printing object, unique label id: 0\n", "M486 S1\n",
+                               "EXCLUDE_OBJECT_START NAME=part_1\n", "EXCLUDE_OBJECT_END NAME=part_0\n" }) {
+        const Sup s = sup_run(chunk_sparse_between(label), sup_before(10., false));
+        INFO(label);
+        CHECK(! s.out.applied);
+        CHECK(s.out.result.fallback == "label_in_sparse");
+        CHECK(sup_join(s.out.result.lines) == sup_join(s.lines));   // released unedited
+    }
+    // a label in a kept path's pre_lines is kept and does not stop the edit
+    std::string t = chunk_sparse_between();
+    t.insert(t.find(";TYPE:Inner wall"), "; start printing object, unique label id: 1\n");
+    const Sup s = sup_run(t, sup_before(10., false));
+    INFO(s.out.result.fallback << " " << s.out.detail);
+    CHECK(s.out.applied);
+    CHECK(has_line(s.out.result.lines, "; start printing object, unique label id: 1\n"));
+}
+
+TEST_CASE("T11 suppress_sparse: ;WIDTH: inside the preceding wall path, width carried only by a removed pre_line (R5)", "[diw_suppress]")
+{
+    SECTION("a ;WIDTH: inside the wall path before the sparse path")
+    {
+        const std::string t = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\n"
+                              "G1 X20 Y10 E1 F1200\n;WIDTH:0.42\nG1 X20 Y20 E1\n;TYPE:Sparse infill\nG1 X15 Y15 E.5 F1500\n"
+                              "G1 X16 Y15 E.1\nG1 X16 Y16 F9000\n;TYPE:Inner wall\nG1 X16 Y18 E.3 F1100\nG1 X12 Y18 E.4\n";
+        const Sup s = sup_run(t, sup_before(0., true));
+        INFO(s.out.result.fallback << " " << s.out.detail);
+        REQUIRE(s.out.applied);
+        // the mid-path ;WIDTH: is in the sparse path's pre_lines (removed); its restore waits for the sparse moves
+        // (no motion line is put inside the wall path, which stays one path: V1)
+        REQUIRE(s.model.paths[1].kind == "powder");
+        CHECK(s.model.paths[1].pre_lines == std::vector<size_t>{ 7, 9 });
+        const std::string want = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\n"
+                                 "G1 X20 Y10 E1 F1200\nG1 X20 Y20 E1\nG1 X16 Y15 F9000\nG1 F1500\nG1 F1500 ;WIDTH:0.42\n"
+                                 "G1 X16 Y16 F9000\n;TYPE:Inner wall\nG1 X16 Y18 E.3 F1100\nG1 X12 Y18 E.4\n";
+        CHECK(sup_join(s.out.result.lines) == want);
+    }
+    SECTION("a width change carried only by the sparse path's pre_lines")
+    {
+        const std::string t = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\n"
+                              "G1 X20 Y10 E1 F1200\nG1 X20 Y20 E1\n;TYPE:Sparse infill\n;WIDTH:0.5\nG1 X15 Y15 E.5 F1500\n"
+                              "G1 X16 Y15 E.1\nG1 X16 Y16 F9000\n;TYPE:Inner wall\nG1 X16 Y18 E.3 F1100\nG1 X12 Y18 E.4\n";
+        const Sup s = sup_run(t, sup_before(0., true));
+        INFO(s.out.result.fallback << " " << s.out.detail);
+        REQUIRE(s.out.applied);
+        CHECK(has_line(s.out.result.lines, "G1 F1500 ;WIDTH:0.5\n"));
+        // the inner wall reads width 0.5 in both texts (V2 checked the end state; here the path itself)
+        std::vector<LineInfo> ei;
+        GCodeScanner sc(s.before);
+        for (const std::string &l : s.out.result.lines) ei.push_back(sc.step(l));
+        LayerChunk lc;
+        lc.end = s.out.result.lines.size();
+        const LayerModel em = parse_core_layer(s.out.result.lines, ei, lc, 0.45);
+        REQUIRE(em.paths.size() == 2);
+        CHECK(em.paths[1].ptype == "inner wall");
+        CHECK(em.paths[1].width == 0.5);
+        REQUIRE(s.model.paths.size() == 3);
+        CHECK(s.model.paths[2].width == 0.5);
+        REQUIRE(ei.back().width);
+        CHECK(*ei.back().width == 0.5);
+    }
+}
+
+TEST_CASE("T11 suppress_sparse: the next chunk's first extruding move without ;TYPE: stays powder kind", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_walls_then_sparse(true), sup_before(0., false));
+    REQUIRE(s.out.applied);
+    const std::vector<std::string> next = sup_split(";LAYER_CHANGE\n;Z:0.6\nG1 Z.6 F600\nG1 X13 Y13 E.3\n;TYPE:Outer wall\n"
+                                                    "G1 X20 Y13 E.5\n");
+    const auto scan_next = [&](const std::vector<std::string> &chunk) {
+        GCodeScanner sc(s.before);
+        for (const std::string &l : chunk) sc.step(l);
+        std::vector<LineInfo> r;
+        for (const std::string &l : next) r.push_back(sc.step(l));
+        return r;
+    };
+    const std::vector<LineInfo> a = scan_next(s.lines), b = scan_next(s.out.result.lines);
+    REQUIRE(a.size() == b.size());
+    for (size_t i = 0; i < a.size(); ++i) {
+        INFO("line " << i);
+        CHECK(same_info(a[i], b[i]));
+    }
+    LayerChunk lc;
+    lc.end = next.size();
+    const LayerModel m = parse_core_layer(next, b, lc, 0.45);
+    REQUIRE(m.paths.size() == 2);
+    CHECK(m.paths[0].kind == "powder");
+    CHECK(m.paths[0].ptype == "sparse infill");
+}
+
+TEST_CASE("T11 suppress_sparse: a sparse vertex on the chunk's bbox edge", "[diw_suppress]")
+{
+    SECTION("on the edge of the walls' box: the edit keeps the bbox")
+    {
+        const Sup s = sup_run(chunk_sparse_between("", "G1 X20 Y15 E12.5 F1500\nG1 X16 Y15 E12.6\n"), sup_before(10., false));
+        INFO(s.out.result.fallback << " " << s.out.detail);
+        CHECK(s.out.applied);
+    }
+    SECTION("5 um outside the walls' box: the edit would shrink the bbox, so the chunk falls back")
+    {
+        const Sup s = sup_run(chunk_sparse_between("", "G1 X20.005 Y15 E12.5 F1500\nG1 X16 Y15 E12.6\n"), sup_before(10., false));
+        INFO(s.out.detail);
+        CHECK(! s.out.applied);
+        CHECK(s.out.result.fallback == "v2_bbox");
+        CHECK(sup_join(s.out.result.lines) == sup_join(s.lines));
+    }
+    SECTION("V3: a removed vertex outside S")
+    {
+        const auto in_s = [](double x, double y) { return x >= 11.0 && x <= 19.0 && y >= 11.0 && y <= 19.0; };
+        const Sup s = sup_run(chunk_sparse_between(), sup_before(10., false), SuppressMutate::none, false, in_s);
+        CHECK(! s.out.applied);
+        CHECK(s.out.result.fallback == "v3_outside");   // the sparse path starts at the wall end (20, 20)
+    }
+}
+
+TEST_CASE("T11 suppress_sparse: infill first with absolute E (leading_abs_e), no trav_f, nothing to remove", "[diw_suppress]")
+{
+    SECTION("infill printed before the walls, absolute E")
+    {
+        const std::string t = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X12 Y12 F9000\n;TYPE:Sparse infill\n;WIDTH:0.5\n"
+                              "G1 X18 Y12 E10.6 F1500\nG1 X18 Y14 E10.8\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\n"
+                              "G1 X20 Y10 E11.8 F1200\nG1 X20 Y20 E12.8\n";
+        const Sup s = sup_run(t, sup_before(10., false));
+        CHECK(! s.out.applied);
+        CHECK(s.out.result.fallback == "leading_abs_e");
+        CHECK(sup_join(s.out.result.lines) == t);
+    }
+    SECTION("infill first with relative E is edited")
+    {
+        const std::string t = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X12 Y12 F9000\n;TYPE:Sparse infill\n;WIDTH:0.5\n"
+                              "G1 X18 Y12 E.6 F1500\nG1 X18 Y14 E.2\nG1 X10 Y10 F9000\n;TYPE:Outer wall\n;WIDTH:0.45\n"
+                              "G1 X20 Y10 E1 F1200\nG1 X20 Y20 E1\n";
+        const Sup s = sup_run(t, sup_before(0., true));
+        INFO(s.out.result.fallback << " " << s.out.detail);
+        CHECK(s.out.applied);
+    }
+    SECTION("no travel before the sparse path in the chunk: no trav_f for R1")
+    {
+        const Sup s = sup_run(chunk_sparse_between("", "G1 X15 Y15 E12.5 F1500\nG1 X16 Y15 E12.6\n", false), sup_before(10., false, 10., 10.));
+        CHECK(! s.out.applied);
+        CHECK(s.out.result.fallback == "no_trav_f");
+    }
+    SECTION("a chunk without sparse infill is released unchanged, not as a fallback")
+    {
+        const std::string t = ";LAYER_CHANGE\n;Z:0.4\nG1 Z.4 F600\nG1 X10 Y10 F9000\n;TYPE:Outer wall\nG1 X20 Y10 E11 F1200\n";
+        const Sup s = sup_run(t, sup_before(10., false));
+        CHECK(s.out.applied);
+        CHECK(s.out.result.removed_moves == 0);
+        CHECK(sup_join(s.out.result.lines) == t);
+    }
+}
+
+TEST_CASE("T11 suppress_sparse: mutations fail V1 or V2", "[diw_suppress]")
+{
+    struct Case
+    {
+        const char *name;
+        std::string text;
+        ScanState   before;
+    };
+    const std::vector<Case> cases = { { "walls then sparse, absolute E", chunk_walls_then_sparse(false), sup_before(10., false) },
+                                      { "walls then sparse, relative E", chunk_walls_then_sparse(true), sup_before(0., false) },
+                                      { "sparse between walls", chunk_sparse_between(), sup_before(10., false) } };
+    for (const Case &c : cases)
+        for (SuppressMutate m : { SuppressMutate::drop_restore, SuppressMutate::extra_delete, SuppressMutate::wrong_g92 }) {
+            INFO(c.name << " / " << to_string(m));
+            const Sup good = sup_run(c.text, c.before);
+            REQUIRE(good.out.applied);
+            // the mutated edit is really produced (verification skipped) and differs from the correct one
+            const Sup raw = sup_run(c.text, c.before, m, true);
+            REQUIRE(raw.out.applied);
+            CHECK(sup_join(raw.out.result.lines) != sup_join(good.out.result.lines));
+            // with verification: a V1 / V2 fallback, and the original lines are released
+            const Sup s = sup_run(c.text, c.before, m);
+            INFO(s.out.result.fallback << " " << s.out.detail);
+            CHECK(! s.out.applied);
+            const std::string &fb = s.out.result.fallback;
+            CHECK((fb.rfind("v1_", 0) == 0 || fb.rfind("v2_", 0) == 0));
+            CHECK(sup_join(s.out.result.lines) == c.text);
+        }
+    CHECK(suppress_mutate_from_string("") == SuppressMutate::none);
+    CHECK(suppress_mutate_from_string("wrong_g92") == SuppressMutate::wrong_g92);
+    CHECK_THROWS_AS(suppress_mutate_from_string("bogus"), std::invalid_argument);
+}
+
+TEST_CASE("T11 core_emission_trace: header with the S1 marker, wall paths, tail, z", "[diw_suppress]")
+{
+    const Sup s = sup_run(chunk_sparse_between(), sup_before(10., false));
+    const std::vector<TraceItem> t = core_emission_trace(s.model, s.lines);
+    // header ;LAYER_CHANGE <S1> ;Z:0.4 ;TYPE:Outer wall ;WIDTH:0.45 | outer wall: start + 2 segments |
+    // inner wall: pre ;TYPE:Inner wall, start + 2 segments | z, z_feed
+    REQUIRE(t.size() == 14);
+    CHECK(t[0].kind == TraceItem::Kind::line);
+    CHECK(t[1].kind == TraceItem::Kind::s1);
+    CHECK(t[5].kind == TraceItem::Kind::path_start);
+    CHECK(t[5].has);
+    CHECK(t[5].c == 9000.);
+    CHECK(t[8].text == ";TYPE:Inner wall\n");
+    CHECK(t[9].kind == TraceItem::Kind::path_start);
+    CHECK(t[9].a == 16.);
+    CHECK(t[9].b == 15.);
+    CHECK(t[12].kind == TraceItem::Kind::z);
+    CHECK(t[12].a == 0.4);
+    CHECK(t[13].kind == TraceItem::Kind::z_feed);
+    CHECK(t[13].a == 600.);
+    TraceItem u = t[10];
+    u.a = std::nextafter(u.a, 1e9);
+    CHECK(u != t[10]);
+}
+
+// ------------------------------------------------------------------------------------------------
+// T12 product binder streams (diw/PRODUCT_DESIGN.md section 8): ShadowOptions::Mode::product on the T8 generator.
+// ------------------------------------------------------------------------------------------------
+
+namespace {
+
+struct PRun
+{
+    std::string              out;
+    PowderShadow::Stats      stats;
+    std::vector<std::string> warnings, fallback_log;
+    bool                     failed = false;
+    std::string              failure, summary;
+};
+
+ShadowOptions prod_opts()
+{
+    ShadowOptions o = topts();
+    o.mode          = ShadowOptions::Mode::product;
+    return o;
+}
+
+PRun run_p(const TranslatorParams &p, const Gen &g, ShadowOptions o, size_t piece = 0, unsigned seed = 1)
+{
+    if (o.placeholder_token.empty())
+        o.placeholder_token = TOKEN;
+    PowderShadow sh(p, o);
+    for (const auto &[id, nl] : g.natives) sh.put_native(id, nl);
+    std::string out;
+    const auto  sink = [&out](std::string_view s) { out.append(s.data(), s.size()); };
+    const std::string_view text(g.text);
+    if (piece == 0)
+        sh.feed(text, sink);
+    else {
+        std::mt19937 rng(seed);
+        for (size_t pos = 0; pos < text.size();) {
+            const size_t len = 1 + rng() % piece;
+            sh.feed(text.substr(pos, len), sink);
+            pos += len;
+        }
+    }
+    sh.finish(sink);
+    return { out, sh.stats(), sh.warnings(), sh.fallback_log(), sh.failed(), sh.failure_message(), sh.summary() };
+}
+
+NativeLayer *native_of(Gen &g, uint64_t id)
+{
+    for (auto &[i, nl] : g.natives)
+        if (i == id)
+            return &nl;
+    return nullptr;
+}
+
+const std::string FAIL_HEAD = "u-MEX powder: the G-code export was stopped because these core layers would be printed without powder:";
+
+std::vector<int> reason_ks(const PowderShadow::Stats &s, const std::string &r)
+{
+    const auto it = s.reasons.find(r);
+    return it == s.reasons.end() ? std::vector<int>() : it->second;
+}
+
+int n_fallbacks(const PowderShadow::Stats &s)
+{
+    int n = 0;
+    for (const auto &[r, ks] : s.fallbacks) n += int(ks.size());
+    return n;
+}
+
+std::vector<int> blocks_k(const std::string &out)
+{
+    std::vector<int> v;
+    for (const PowderLayerRec &b : parse_records(out).blocks) v.push_back(b.k);
+    return v;
+}
+
+void set_env(const char *k, const char *v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v)
+        setenv(k, v, 1);
+    else
+        unsetenv(k);
+#endif
+}
+
+const char *ENV_KEYS[] = { "ORCA_DIW_POWDER_MODE", "ORCA_DIW_TEST_NO_SUPPRESS", "ORCA_DIW_TEST_SUPPRESS_MUTATE", "ORCA_DIW_TEST_SKIP_VERIFY",
+                           "ORCA_DIW_SHADOW_FAULT", "ORCA_DIW_SHADOW_DUMP", "ORCA_DIW_SHADOW_KEEP_PLACEHOLDERS" };
+
+// An extrusion outside the part (X60-70), with an optional ;TYPE: line and the layer's own Z first.
+std::string outside_extrusion(const std::string &type, double z)
+{
+    std::string s;
+    if (! type.empty())
+        s += ";TYPE:" + type + "\n";
+    if (z > 0.)
+        s += "G1 Z" + f3(z) + " F600\n";
+    return s + "G1 X60.000 Y60.000 F9000\nG1 X70.000 Y60.000 E1 F1500\n";
+}
+
+} // namespace
+
+TEST_CASE("T12 product binder: st=ok chunks are suppressed, the translation equals the shadow export's", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    const Gen                g   = make(stack(5));
+    const PRun               sh  = run_p(p, g, topts());
+    const PRun               pr  = run_p(p, g, prod_opts());
+    // shadow mode (the struct default) is the T8 binder byte for byte
+    CHECK(sh.out == run_binder(p, g).out);
+    CHECK(sh.summary.rfind("DIW shadow planner: 3 block(s), 0 carrier(s), final=1; max_held=1 ", 0) == 0);
+    CHECK(sh.summary.find(" orphan=0") != std::string::npos);
+    CHECK(! sh.failed);
+    CHECK(sh.stats.suppressed == 0);
+    // product: same blocks, sparse infill removed from the three st=ok chunks, nothing else differs after translation
+    CHECK(! pr.failed);
+    CHECK(pr.failure.empty());
+    CHECK(pr.warnings.empty());
+    CHECK(pr.fallback_log.empty());
+    CHECK(dump_records(parse_records(pr.out)) == dump_records(parse_records(sh.out)));
+    CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 3, 4 });
+    CHECK(pr.stats.suppressed == 3);
+    CHECK(n_fallbacks(pr.stats) == 0);
+    CHECK(pr.stats.removed_moves == 6);
+    CHECK(pr.stats.removed_de == 12.0);
+    CHECK(count_of(sh.out, "Y37.000 E2 F1500") == 10);
+    CHECK(count_of(pr.out, "Y37.000 E2 F1500") == 4);   // the bottom and top layers keep their skin
+    CHECK(count_of(pr.out, ";TYPE:Sparse infill") == 3); // the end-of-chunk R4 restores, one per edited chunk
+    CHECK(diw_translate_gcode(pr.out, cfg) == diw_translate_gcode(sh.out, cfg));
+    CHECK(pr.summary.rfind("DIW powder planner (product): 3 block(s), 0 carrier(s), suppressed=3 fallback=0 removed_moves=6; max_held=1 ", 0) == 0);
+    CHECK(pr.summary.find(" orphan=0 native_only=0 native_only_nosparse=0 removed_de=12.0") != std::string::npos);
+    for (size_t piece : { 1, 3, 64 })
+        CHECK(run_p(p, g, prod_opts(), piece, 7).out == pr.out);
+    // the edited text re-binds to the same blocks in shadow mode, and its own product replay changes nothing more
+    ShadowOptions to = topts();
+    to.text_only     = true;
+    const Gen   gt{ strip_records(without_placeholders(pr.out)), {} };
+    const PRun  rt = run_p(p, gt, to);
+    CHECK(blocks_k(rt.out).empty());   // no sparse infill is left in the text: v2 would see no core layer (4.5)
+}
+
+TEST_CASE("T12 product binder: no suppression, suppress fault, mutations", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    const Gen                g   = make(stack(5));
+    const PRun               sh  = run_p(p, g, topts());
+    const PRun               pr  = run_p(p, g, prod_opts());
+    {
+        ShadowOptions o = prod_opts();
+        o.suppress      = false;
+        const PRun r    = run_p(p, g, o);
+        CHECK(r.out == sh.out);
+        CHECK(! r.failed);
+        CHECK(r.stats.suppressed == 0);
+        CHECK(n_fallbacks(r.stats) == 0);
+    }
+    {
+        // the suppression throws: a counted fallback, never a failure; the chunks are released unedited
+        ShadowOptions o = prod_opts();
+        o.fault         = "suppress";
+        const PRun r    = run_p(p, g, o);
+        CHECK(r.out == sh.out);
+        CHECK(! r.failed);
+        CHECK(r.warnings.empty());
+        CHECK(r.stats.fallbacks.at("exception") == std::vector<int>{ 2, 3, 4 });
+        REQUIRE(r.fallback_log.size() == 1);
+        CHECK(r.fallback_log[0] == "u-MEX powder: sparse infill kept in the G-code text of layer(s) 2, 3, 4 (suppression fallback "
+                                   "exception: k=2: fault injection: suppress)");
+        CHECK(r.summary.find("suppressed=0 fallback=3 removed_moves=0;") != std::string::npos);
+    }
+    for (SuppressMutate m : { SuppressMutate::drop_restore, SuppressMutate::extra_delete, SuppressMutate::wrong_g92 }) {
+        INFO("mutation " << to_string(m));
+        ShadowOptions o = prod_opts();
+        o.mutate        = m;
+        const PRun r    = run_p(p, g, o);
+        CHECK(r.out == sh.out);   // V1 / V2 catch every wrong edit
+        CHECK(! r.failed);
+        CHECK(n_fallbacks(r.stats) == 3);
+        for (const auto &[reason, ks] : r.stats.fallbacks)
+            CHECK((reason.rfind("v1_", 0) == 0 || reason.rfind("v2_", 0) == 0));
+        o.skip_verify = true;
+        const PRun u  = run_p(p, g, o);
+        CHECK(u.stats.suppressed == 3);
+        CHECK(u.out != pr.out);   // the wrong edit is released when the checks are skipped
+    }
+}
+
+TEST_CASE("T12 product binder: text_only, native_only (a) and (b)", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    {
+        // text_only: k=3 is sparse by its text, not by the native roles
+        std::vector<Lay> v = stack(5);
+        v[2].ph            = { 0 };
+        const Gen  g       = make(v);
+        const PRun sh      = run_p(p, g, topts());
+        CHECK(reason_ks(sh.stats, "disagree_text_only") == std::vector<int>{ 3 });
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 4 });
+        CHECK(reason_ks(pr.stats, "text_only") == std::vector<int>{ 3 });
+        REQUIRE(pr.warnings.size() == 1);
+        CHECK(pr.warnings[0] == "u-MEX powder: layer(s) 3 have moves typed sparse infill but no sparse infill of the part (custom G-code "
+                                "or a prime tower inherits ;TYPE:); they are printed as paste.");
+        CHECK(pr.stats.suppressed == 2);
+    }
+    {
+        // native_only (a): custom G-code types an extrusion outside the part as top surface on every core layer
+        std::vector<Lay> v = stack(5);
+        for (int i = 1; i <= 3; ++i) v[size_t(i)].user = outside_extrusion("Top surface", v[size_t(i)].z);
+        const Gen  g     = make(v);
+        const PRun plain = run_p(p, make(stack(5)), prod_opts());
+        const PRun sh    = run_p(p, g, topts());
+        CHECK(reason_ks(sh.stats, "disagree_native_only") == std::vector<int>{ 2, 3, 4 });
+        CHECK(blocks_k(sh.out).empty());
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(pr.warnings.empty());
+        CHECK(pr.stats.native_only == 3);
+        CHECK(dump_records(parse_records(pr.out)) == dump_records(parse_records(plain.out)));
+        CHECK(pr.stats.suppressed == 3);
+        CHECK(count_of(pr.out, "G1 X70.000 Y60.000 E1 F1500") == 3);   // the user's paste moves stay
+        CHECK(pr.summary.find(" native_only=3 native_only_nosparse=0 ") != std::string::npos);
+    }
+    {
+        // native_only (b): native core, but the text has no sparse path at all
+        std::vector<Lay> v = stack(5);
+        v[2].infill        = "Internal solid infill";
+        const Gen  g       = make(v);
+        const PRun sh      = run_p(p, g, topts());
+        CHECK(reason_ks(sh.stats, "disagree_native_only") == std::vector<int>{ 3 });
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 4 });
+        CHECK(reason_ks(pr.stats, "native_only_nosparse") == std::vector<int>{ 3 });
+        CHECK(pr.stats.native_only == 0);
+        REQUIRE(pr.warnings.size() == 1);
+        CHECK(pr.warnings[0] == "u-MEX powder: layer(s) 3 have sparse infill in the slice but none was printed (all paths too short); "
+                                "they are printed without powder.");
+        CHECK(pr.summary.find(", native_only_nosparse=") == std::string::npos);   // not in the reason list
+        CHECK(pr.summary.find(" native_only=0 native_only_nosparse=1 ") != std::string::npos);
+    }
+}
+
+TEST_CASE("T12 product binder: final layer, arc / G91 in a core chunk, st=open", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    {
+        std::vector<Lay> v = stack(4);
+        v.back().infill    = "Sparse infill";
+        v.back().ph        = { 1 };
+        const Gen  g       = make(v);
+        const PRun pr      = run_p(p, g, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 3 });
+        CHECK(reason_ks(pr.stats, "final") == std::vector<int>{ 4 });
+        REQUIRE(pr.warnings.size() == 1);
+        CHECK(pr.warnings[0] == "u-MEX powder: the last printed layer (k=4) has sparse infill without a top surface; the last layer is "
+                                "never filled with powder, it is printed as paste.");
+        // a last layer that is not a native core layer is silent
+        const PRun pn = run_p(p, make(stack(5)), prod_opts());
+        CHECK(pn.stats.reasons.count("final") == 0);
+    }
+    {
+        std::vector<Lay> v = stack(7);
+        v[2].arc           = true;   // k=3: arc-fitted, native not core: silent
+        v[2].ph            = { 0 };
+        v[3].arc           = true;   // k=4: arc in a native core chunk: fatal
+        v[4].g91           = true;   // k=5: G91 in a native core chunk: fatal
+        const Gen  g       = make(v);
+        const PRun sh      = run_p(p, g, topts());
+        CHECK(reason_ks(sh.stats, "arc_g91") == std::vector<int>{ 3, 4, 5 });
+        CHECK(! sh.failed);
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(pr.failed);
+        CHECK(reason_ks(pr.stats, "arc_g91") == std::vector<int>{ 4, 5 });
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 6 });
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 4, 5: arc moves (G2/G3) or relative positioning (G91) in the layer; arc fitting is "
+                                        "off on DIW printers, so check the custom G-code of these layers.");
+    }
+    {
+        // the planner finds no ring (P0): shadow writes the st=open block, product stops the export
+        Gen g = make(stack(5));
+        REQUIRE(native_of(g, 3) != nullptr);
+        native_of(g, 3)->rings = { Polygons() };
+        const PRun sh = run_p(p, g, topts());
+        CHECK(blocks_k(sh.out) == std::vector<int>{ 2, 3, 4 });
+        CHECK(parse_records(sh.out).blocks[1].status == PowderLayerRec::Status::open);
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(pr.failed);
+        CHECK(reason_ks(pr.stats, "open") == std::vector<int>{ 3 });
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2, 4 });
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 3: the outer walls do not enclose a cavity.");
+    }
+}
+
+TEST_CASE("T12 product binder: internal errors stop the export", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    {
+        std::vector<Lay> v = stack(6);
+        v[1].ph            = { 1, 1 };   // k=2 merged
+        v[2].native        = false;      // k=3 lost
+        Gen g              = make(v);
+        NativeLayer orphan_capture;
+        orphan_capture.native_core = true;
+        g.natives.emplace_back(777, orphan_capture);
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(pr.failed);
+        CHECK(pr.warnings.empty());
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 4, 5 });
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 2: internal error (merged_multi_core). Please report this with the 3MF." +
+                                "\nlayer(s) 3: internal error (lost). Please report this with the 3MF." +
+                                "\ninternal error (lost_placeholder: 1 captured layer(s) never reached the G-code output). Please "
+                                "report this with the 3MF.");
+        const PRun sh = run_p(p, g, topts());
+        CHECK(! sh.failed);
+        CHECK(sh.failure.empty());
+    }
+    {
+        Gen g = make(stack(5));
+        native_of(g, 3)->error = "boom";
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 3: internal error (capture: boom). Please report this with the 3MF.");
+    }
+    {
+        std::vector<Lay> v = stack(5);
+        v[2].native_shift  = 0.002;
+        const PRun pr      = run_p(p, make(v), prod_opts());
+        CHECK(pr.failed);
+        CHECK(reason_ks(pr.stats, "frame") == std::vector<int>{ 3 });
+        CHECK(pr.failure.rfind(FAIL_HEAD + "\nlayer(s) 3: internal error (frame: text wall vertex (", 0) == 0);
+    }
+    const Gen g = make(stack(5));
+    {
+        ShadowOptions o = prod_opts();
+        o.fault         = "plan";
+        const PRun pr   = run_p(p, g, o, 11, 2);
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 2, 3, 4: internal error (plan: fault injection: plan). Please report this with the 3MF.");
+    }
+    {
+        ShadowOptions o = prod_opts();
+        o.fault         = "binder";
+        const PRun pr   = run_p(p, g, o, 11, 2);
+        CHECK(pr.out == without_placeholders(g.text));
+        CHECK(pr.failed);
+        CHECK(! pr.stats.no_core);
+        CHECK(pr.failure == FAIL_HEAD + "\ninternal error (binder: fault injection: binder). Please report this with the 3MF.");
+    }
+    {
+        // sync() releases the open chunk k=3 with its m=1 placeholder: fatal sync
+        const Gen    g6 = make(stack(6));
+        PowderShadow sh(p, prod_opts());
+        for (const auto &[id, nl] : g6.natives) sh.put_native(id, nl);
+        std::string out;
+        const auto  sink = [&out](std::string_view s) { out.append(s.data(), s.size()); };
+        const size_t l3  = g6.text.find(";Z:1.800");
+        const size_t cut = g6.text.find(" E1.5", l3) + 3;
+        sh.feed(std::string_view(g6.text).substr(0, cut), sink);
+        sh.sync(sink);
+        sh.feed(std::string_view(g6.text).substr(cut), sink);
+        sh.finish(sink);
+        CHECK(sh.failed());
+        CHECK(sh.stats().reasons.at("sync") == std::vector<int>{ 3 });
+        CHECK(blocks_k(out) == std::vector<int>{ 2, 4, 5 });
+        CHECK(sh.failure_message() == FAIL_HEAD + "\nlayer(s) 3: internal error (sync). Please report this with the 3MF.");
+    }
+}
+
+TEST_CASE("T12 product binder: no block at all, orphan sparse extrusions", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    {
+        std::vector<Lay> v = stack(5);
+        for (Lay &l : v) {
+            l.infill = "Internal solid infill";
+            l.ph     = { 0 };
+        }
+        const PRun pr = run_p(p, make(v), prod_opts());
+        CHECK(pr.failed);
+        CHECK(pr.stats.no_core);
+        CHECK(pr.failure == FAIL_HEAD + "\nno layer of this plate is a powder core layer (sparse infill without top or bottom surface). Turn "
+                                        "u-MEX powder infill off, or give the part sparse infill.");
+        CHECK(pr.summary.find(", no_core, suppressed=0") != std::string::npos);
+        const PRun sh = run_p(p, make(v), topts());
+        CHECK(! sh.failed);
+        CHECK(! sh.stats.no_core);
+        // the only native core layer is the last one
+        v.back().infill = "Sparse infill";
+        v.back().ph     = { 1 };
+        const PRun pf   = run_p(p, make(v), prod_opts());
+        CHECK(pf.failure == FAIL_HEAD + "\nno layer of this plate is a powder core layer (sparse infill without top or bottom surface); the "
+                                        "only one is the last layer, which is never filled. Turn u-MEX powder infill off, or give the part "
+                                        "sparse infill.");
+        CHECK(pf.warnings.size() == 1);
+    }
+    {
+        // an untyped extrusion at the layer change, outside the part: on k=2 it inherits the bottom surface of k=1
+        // (paste: k=2 becomes native_only (a)); on k=3 and k=4 it inherits Sparse infill and lies outside S
+        std::vector<Lay> v = stack(5);
+        for (int i = 1; i <= 3; ++i) v[size_t(i)].user = outside_extrusion("", 0.);
+        const Gen  g  = make(v);
+        const PRun sh = run_p(p, g, topts());
+        CHECK(! sh.failed);
+        CHECK(blocks_k(sh.out) == std::vector<int>{ 3, 4 });
+        CHECK(sh.stats.orphan == std::vector<int>{ 3, 4 });   // counted only
+        CHECK(sh.stats.reasons.count("orphan") == 0);
+        CHECK(sh.summary.find(" orphan=2") != std::string::npos);
+        CHECK(sh.warnings == std::vector<std::string>{ "u-MEX native powder planner: 1 core layer(s) (2) left as paste: the native "
+                                                       "classification makes them core layers but the G-code text does not" });
+        const PRun pr = run_p(p, g, prod_opts());
+        CHECK(pr.failed);
+        CHECK(pr.stats.native_only == 1);
+        CHECK(reason_ks(pr.stats, "orphan") == std::vector<int>{ 3, 4 });
+        CHECK(blocks_k(pr.out) == std::vector<int>{ 2 });
+        CHECK(pr.failure == FAIL_HEAD + "\nlayer(s) 3, 4: extrusions typed sparse infill lie outside the part's outer walls (first at X60.0 "
+                                        "Y60.0); sparse infill must lie inside the part's outer walls (tolerance: half an outer-wall width). "
+                                        "Possible causes: an extrusion typed sparse infill outside the part, such as custom G-code without its "
+                                        "own ;TYPE: line (for example the layer change G-code) or a prime tower, or an island whose outer wall "
+                                        "is missing.");
+        CHECK(pr.summary.find(", orphan=") == std::string::npos);
+        CHECK(pr.summary.find(" orphan=2 native_only=1 ") != std::string::npos);
+    }
+    {
+        // F3 regression: legal sparse infill may overshoot the outer-wall centerline (the ring, x = 10) within the wall
+        // bead (infill_wall_overlap). The outer wall is 1.2 mm wide, so the orphan tolerance is 0.6 mm: 0.5 mm outside
+        // the centerline is no orphan, 1.0 mm outside is.
+        const auto overshoot = [](double x, double z) {
+            return ";TYPE:Sparse infill\nG1 Z" + f3(z) + " F600\nG1 X" + f3(x) + " Y20.000 F9000\nG1 X" + f3(x) +
+                   " Y25.000 E1 F1500\n";
+        };
+        for (const auto &[x, orphan] : std::vector<std::pair<double, bool>>{ { 9.5, false }, { 9.45, false }, { 9.0, true } }) {
+            INFO("overshoot x = " << x);
+            std::vector<Lay> v = stack(5);
+            for (int i = 1; i <= 3; ++i) v[size_t(i)].user = overshoot(x, v[size_t(i)].z);
+            const PRun pr = run_p(p, make(v), prod_opts());
+            CHECK(pr.failed == orphan);
+            CHECK(reason_ks(pr.stats, "orphan").empty() == ! orphan);
+            const PRun sh = run_p(p, make(v), topts());
+            CHECK(sh.stats.orphan.empty() == ! orphan);
+        }
+    }
+}
+
+TEST_CASE("T12 product binder: cancel fault, carriers", "[diw_product]")
+{
+    const DynamicPrintConfig cfg = make_cfg();
+    const TranslatorParams   p   = diw_read_translator_params(cfg);
+    const Gen                g   = make(stack(5));
+    for (ShadowOptions o : { prod_opts(), topts() }) {
+        INFO("mode " << to_string(o.mode));
+        o.fault = "cancel";
+        PowderShadow sh(p, o);
+        for (const auto &[id, nl] : g.natives) sh.put_native(id, nl);
+        std::string out;
+        CHECK_THROWS_AS(sh.feed(g.text, [&out](std::string_view s) { out.append(s.data(), s.size()); }), CanceledException);
+        CHECK(! sh.failed());
+        CHECK(sh.failure_message().empty());
+    }
+    {
+        // h <= 0 carrier: a valid block in product mode; only the st=ok chunks are edited
+        std::vector<Lay> v = stack(5);
+        v[2].z             = v[1].z;
+        v[2].height        = "0";
+        const Gen  gc      = make(v);
+        const PRun sh      = run_p(p, gc, topts());
+        const PRun pr      = run_p(p, gc, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(dump_records(parse_records(pr.out)) == dump_records(parse_records(sh.out)));
+        CHECK(pr.stats.carriers == 1);
+        CHECK(pr.stats.suppressed == 2);
+        CHECK(diw_translate_gcode(pr.out, cfg) == diw_translate_gcode(sh.out, cfg));
+    }
+    {
+        const DynamicPrintConfig ce = make_cfg({ { "diw_powder_overflow_policy", "error" }, { "diw_powder_speed_max", "1" } });
+        const TranslatorParams   pe = diw_read_translator_params(ce);
+        const PRun               sh = run_p(pe, g, topts());
+        const PRun               pr = run_p(pe, g, prod_opts());
+        CHECK(! pr.failed);
+        CHECK(pr.out == sh.out);   // carriers only: nothing is edited
+        CHECK(pr.stats.carriers == 3);
+        CHECK(pr.stats.suppressed == 0);
+    }
+}
+
+TEST_CASE("T12 powder_refusal_reason and ShadowOptions::from_env", "[diw_product]")
+{
+    const DynamicPrintConfig base = make_cfg();
+    CHECK(powder_refusal_reason(base, false, false, false).empty());
+    CHECK(powder_refusal_reason(base, true, true, true) == "BBL printer G-code (the layer markers are in the BBL dialect)");
+    CHECK(powder_refusal_reason(base, false, true, true) == "spiral vase mode");
+    CHECK(powder_refusal_reason(base, false, false, true) == "G-code axis remap");
+    DynamicPrintConfig belt = base;
+    belt.set_key_value("belt_printer", new ConfigOptionBool(true));
+    CHECK(powder_refusal_reason(belt, false, false, false) == "belt printer");
+    DynamicPrintConfig eo = make_cfg({ { "extruder_offset", "0x0,1x0" } });
+    CHECK(powder_refusal_reason(eo, false, false, false) == "extruders that have different extruder_offset values");
+    DynamicPrintConfig same = make_cfg({ { "extruder_offset", "2x3,2x3" } });
+    CHECK(powder_refusal_reason(same, false, false, false).empty());
+
+    std::vector<std::pair<std::string, std::string>> saved;
+    for (const char *k : ENV_KEYS) {
+        const char *v = std::getenv(k);
+        saved.emplace_back(k, v ? v : "");
+        set_env(k, nullptr);
+    }
+    {
+        const ShadowOptions o = ShadowOptions::from_env();
+        CHECK(o.mode == ShadowOptions::Mode::product);
+        CHECK(o.suppress);
+        CHECK(o.mutate == SuppressMutate::none);
+        CHECK(! o.skip_verify);
+        CHECK(o.fault.empty());
+        CHECK(ShadowOptions().mode == ShadowOptions::Mode::shadow);   // the struct default
+    }
+    set_env("ORCA_DIW_POWDER_MODE", "shadow");
+    CHECK(ShadowOptions::from_env().mode == ShadowOptions::Mode::shadow);
+    set_env("ORCA_DIW_POWDER_MODE", "product");
+    CHECK(ShadowOptions::from_env().mode == ShadowOptions::Mode::product);
+    set_env("ORCA_DIW_POWDER_MODE", "bogus");
+    CHECK_THROWS_AS(ShadowOptions::from_env(), std::invalid_argument);
+    set_env("ORCA_DIW_POWDER_MODE", nullptr);
+    set_env("ORCA_DIW_TEST_NO_SUPPRESS", "1");
+    set_env("ORCA_DIW_TEST_SUPPRESS_MUTATE", "wrong_g92");
+    set_env("ORCA_DIW_TEST_SKIP_VERIFY", "1");
+    set_env("ORCA_DIW_SHADOW_FAULT", "cancel");
+    {
+        const ShadowOptions o = ShadowOptions::from_env();
+        CHECK(! o.suppress);
+        CHECK(o.mutate == SuppressMutate::wrong_g92);
+        CHECK(o.skip_verify);
+        CHECK(o.fault == "cancel");
+    }
+    set_env("ORCA_DIW_TEST_SUPPRESS_MUTATE", "bogus");
+    CHECK_THROWS_AS(ShadowOptions::from_env(), std::invalid_argument);
+    for (const auto &[k, v] : saved) set_env(k.c_str(), v.empty() ? nullptr : v.c_str());
 }

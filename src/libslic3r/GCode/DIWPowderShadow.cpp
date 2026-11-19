@@ -256,6 +256,118 @@ std::vector<TextPath> text_paths(const LayerModel &model, const char *kind, size
     return out;
 }
 
+// ---- orphan check (PRODUCT_DESIGN.md 3.4, gate 12) and V3: S with a tolerance ----
+// V3 uses 10 um. The orphan check uses half the outer-wall width of the layer (orphan_tolerance_nm): legal sparse
+// infill may overshoot the outer-wall centerline within the wall bead (infill_wall_overlap), and S is bounded by that
+// centerline; a real orphan (prime tower, custom G-code) lies outside the part, beyond the bead.
+
+struct SCover
+{
+    static constexpr double DEFAULT_TOL_NM = 10000.;   // 10 um
+    const ExPolygons        &S;
+    double                   TOL_NM;
+    std::vector<BoundingBox> bbs;                      // each contour's box grown by the tolerance
+
+    explicit SCover(const ExPolygons &s, double tol_nm = DEFAULT_TOL_NM) : S(s), TOL_NM(tol_nm)
+    {
+        bbs.reserve(S.size());
+        for (const ExPolygon &e : S) {
+            BoundingBox b = get_extents(e.contour);
+            b.offset(TOL_NM + 1.);
+            bbs.push_back(b);
+        }
+    }
+    static double seg_dist(const Vec2d &p, const Vec2d &a, const Vec2d &b)
+    {
+        const Vec2d  ab = b - a;
+        const double l2 = ab.squaredNorm();
+        double       t  = l2 > 0. ? (p - a).dot(ab) / l2 : 0.;
+        t               = std::max(0., std::min(1., t));
+        return (p - (a + t * ab)).norm();
+    }
+    bool near_ring(const Vec2d &p, const Points &pts) const
+    {
+        for (size_t i = 0; i < pts.size(); ++i)
+            if (seg_dist(p, pts[i].cast<double>(), pts[(i + 1) % pts.size()].cast<double>()) <= TOL_NM)
+                return true;
+        return false;
+    }
+    // The point (mm) lies in S (boundary included) or within the tolerance of its boundary.
+    bool covers(double x_mm, double y_mm) const
+    {
+        const Point p = to_grid(Vec2d(x_mm, y_mm));
+        for (size_t i = 0; i < S.size(); ++i)
+            if (bbs[i].contains(p) && S[i].contains(p, true))
+                return true;
+        const Vec2d pd = p.cast<double>();
+        for (size_t i = 0; i < S.size(); ++i) {
+            if (! bbs[i].contains(p))
+                continue;
+            if (near_ring(pd, S[i].contour.points))
+                return true;
+            for (const Polygon &h : S[i].holes)
+                if (near_ring(pd, h.points))
+                    return true;
+        }
+        return false;
+    }
+};
+
+// Half the widest outer / overhang wall of the layer (nm), never below the 10 um of V3.
+double orphan_tolerance_nm(const std::vector<TextPath> &walls)
+{
+    double w = 0.;
+    for (const TextPath &t : walls)
+        if (t.ptype == "outer wall" || t.ptype == "overhang wall")
+            w = std::max(w, t.width);
+    return std::max(SCover::DEFAULT_TOL_NM, 0.5 * w * 1e6);
+}
+
+// "X<x> Y<y>" of the first powder-kind vertex or segment midpoint outside S, or "".
+std::string orphan_point(const std::vector<TextPath> &powder, const SCover &cover)
+{
+    for (const TextPath &t : powder)
+        for (size_t i = 0; i < t.pts_mm.size(); ++i) {
+            const Vec2d &v = t.pts_mm[i];
+            if (! cover.covers(v.x(), v.y()))
+                return "X" + py_repr(v.x()) + " Y" + py_repr(v.y());
+            if (i + 1 < t.pts_mm.size()) {
+                const Vec2d m = 0.5 * (v + t.pts_mm[i + 1]);
+                if (! cover.covers(m.x(), m.y()))
+                    return "X" + py_repr(m.x()) + " Y" + py_repr(m.y());
+            }
+        }
+    return std::string();
+}
+
+// The dump's chunk_sha_pre: FNV-1a 64 of the held chunk's bytes (placeholder lines included), "fnv1a64:<16 hex>".
+std::string fnv1a64_hex(const std::vector<std::string> &lines)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const std::string &l : lines)
+        for (unsigned char c : l) {
+            h ^= c;
+            h *= 0x100000001b3ull;
+        }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "fnv1a64:%016llx", (unsigned long long) h);
+    return buf;
+}
+
+// k list of a reason, as the warnings print it: the first 10, then "... (<n> more)".
+std::string k_list(const std::vector<int> &ks)
+{
+    std::string list;
+    for (size_t i = 0; i < ks.size() && i < 10; ++i) list += (i ? ", " : "") + std::to_string(ks[i]);
+    if (ks.size() > 10)
+        list += ", ... (" + std::to_string(ks.size() - 10) + " more)";
+    return list;
+}
+
+// Product mode (PRODUCT_DESIGN.md 5.1): the reasons that stop the export.
+const std::set<std::string> FATAL_PRODUCT = { "arc_g91", "open", "orphan", "merged_multi_core", "lost", "lost_placeholder",
+                                               "capture", "no_z", "frame", "plan", "record", "sync" };
+
 const char *reason_label(const std::string &r)
 {
     if (r == "capture") return "capture failed";
@@ -370,11 +482,23 @@ std::string token_or_random(const std::string &t)
 ShadowOptions ShadowOptions::from_env()
 {
     ShadowOptions o;
+    const std::string mode = getenv_str("ORCA_DIW_POWDER_MODE");
+    if (mode.empty() || mode == "product")
+        o.mode = Mode::product;
+    else if (mode == "shadow")
+        o.mode = Mode::shadow;
+    else
+        throw std::invalid_argument("ORCA_DIW_POWDER_MODE must be product or shadow, not '" + mode + "'");
+    o.suppress          = getenv_str("ORCA_DIW_TEST_NO_SUPPRESS") != "1";
+    o.mutate            = suppress_mutate_from_string(getenv_str("ORCA_DIW_TEST_SUPPRESS_MUTATE"));
+    o.skip_verify       = getenv_str("ORCA_DIW_TEST_SKIP_VERIFY") == "1";
     o.keep_placeholders = getenv_str("ORCA_DIW_SHADOW_KEEP_PLACEHOLDERS") == "1";
     o.dump_dir          = getenv_str("ORCA_DIW_SHADOW_DUMP");
     o.fault             = getenv_str("ORCA_DIW_SHADOW_FAULT");
     return o;
 }
+
+const char *to_string(ShadowOptions::Mode m) { return m == ShadowOptions::Mode::product ? "product" : "shadow"; }
 
 // ------------------------------------------------------------------------------------------------ PowderShadow
 
@@ -396,6 +520,23 @@ PowderShadow::PowderShadow(std::unique_ptr<TranslatorParams> p, ShadowOptions op
 
 // ------------------------------------------------------------------------------------------------ create (section 3)
 
+std::string powder_refusal_reason(const DynamicPrintConfig &full, bool bbl_printer, bool spiral_vase, bool axis_remap)
+{
+    if (bbl_printer)
+        return "BBL printer G-code (the layer markers are in the BBL dialect)";
+    if (spiral_vase)
+        return "spiral vase mode";
+    if (axis_remap)
+        return "G-code axis remap";
+    if (const auto *belt = full.option<ConfigOptionBool>("belt_printer"); belt != nullptr && belt->value)
+        return "belt printer";
+    if (const auto *eo = full.option<ConfigOptionPoints>("extruder_offset"); eo != nullptr)
+        for (const Vec2d &v : eo->values)
+            if (v != eo->values.front())
+                return "extruders that have different extruder_offset values";
+    return std::string();
+}
+
 std::shared_ptr<PowderShadow> PowderShadow::create(const Print &print, const DynamicPrintConfig &full, bool spiral_vase,
                                                    bool axis_remap, std::string *reason)
 {
@@ -407,21 +548,8 @@ std::shared_ptr<PowderShadow> PowderShadow::create(const Print &print, const Dyn
             return nullptr;   // not a powder job: silent
         if (getenv_str("ORCA_DIW_NO_NATIVE_PLAN") == "1")
             why = "kill switch ORCA_DIW_NO_NATIVE_PLAN=1 is set";
-        else if (print.is_BBL_printer())
-            why = "BBL printer G-code (the layer markers are in the BBL dialect)";
-        else if (spiral_vase)
-            why = "spiral vase mode";
-        else if (axis_remap)
-            why = "G-code axis remap";
-        else if (const auto *belt = full.option<ConfigOptionBool>("belt_printer"); belt != nullptr && belt->value)
-            why = "belt printer";
-        else if (const auto *eo = full.option<ConfigOptionPoints>("extruder_offset"); eo != nullptr) {
-            for (const Vec2d &v : eo->values)
-                if (v != eo->values.front()) {
-                    why = "the extruders have different extruder_offset values";
-                    break;
-                }
-        }
+        else
+            why = powder_refusal_reason(full, print.is_BBL_printer(), spiral_vase, axis_remap);
         if (why.empty()) {
             std::unique_ptr<TranslatorParams> tp;
             try {
@@ -813,8 +941,11 @@ void PowderShadow::feed(std::string_view bytes, const Sink &sink)
 
 void PowderShadow::handle_line(std::string &&line, bool &consumed)
 {
-    const size_t   i  = m_line_no++;
-    const LineInfo li = m_scanner.step(line);
+    const size_t        i           = m_line_no++;
+    const ScanState     scan_before = m_scanner.state();
+    const ExtrusionBBox bbox_before = m_bbox;
+    const LineInfo      li          = m_scanner.step(line);
+    extrusion_bbox(line, m_bbox);
     if (line.find("; CONFIG_BLOCK_START") != std::string::npos) {
         // split_layers stops here: the held chunk is the final one.
         if (std::optional<LayerChunk> c = m_tracker.finish(i))
@@ -827,7 +958,9 @@ void PowderShadow::handle_line(std::string &&line, bool &consumed)
     if (m_tracker.step(i, line, li) == ChunkTracker::opened) {
         if (std::optional<LayerChunk> c = m_tracker.take_closed())
             close_chunk(*c, false);
-        m_unbindable = false;
+        m_unbindable        = false;
+        m_chunk_before      = scan_before;   // line i is the new chunk's line 0
+        m_chunk_bbox_before = bbox_before;
     }
     if (m_tracker.current() == nullptr) {
         consumed = true;
@@ -893,8 +1026,9 @@ void PowderShadow::close_chunk(const LayerChunk &chunk, bool final)
 
 std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool final)
 {
-    const int         k = chunk.index;
-    const UMexParams &U = P.U;
+    const int         k       = chunk.index;
+    const UMexParams &U       = P.U;
+    const bool        product = m_opts.product();
 
     // Every placeholder's capture is consumed here, whatever the outcome.
     std::vector<std::pair<Placeholder, std::optional<NativeLayer>>> phs;
@@ -903,16 +1037,7 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
     // gate 0
     if (phs.empty() && ! m_opts.text_only)
         return std::nullopt;
-    // gate 1, 2
-    if (final) {
-        count("final", k);
-        return std::nullopt;
-    }
-    if (chunk.has_arc || chunk.has_relxyz) {
-        count("arc_g91", k);
-        return std::nullopt;
-    }
-    // gate 3: v2 classify_layers (auto rule) on the text vs the native classification
+    // v2 classify_layers (auto rule) on the text, and the native classification
     bool has_sparse = false, has_skin = false;
     for (const std::string &t : chunk.types) {
         has_sparse |= SPARSE_T.count(t) > 0;
@@ -923,12 +1048,43 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
     for (const auto &ph : phs) n_m1 += ph.first.m ? 1 : 0;
     const bool adapter_only = phs.empty();   // text-only replay without placeholders
     const bool native_core  = adapter_only ? text_core : n_m1 > 0;
-    if (text_core != native_core) {
-        count(text_core ? "disagree_text_only" : "disagree_native_only", k);
-        return std::nullopt;
+
+    if (! product) {
+        // gate 1, 2
+        if (final) {
+            count("final", k);
+            return std::nullopt;
+        }
+        if (chunk.has_arc || chunk.has_relxyz) {
+            count("arc_g91", k);
+            return std::nullopt;
+        }
+        // gate 3: both classifications must agree
+        if (text_core != native_core) {
+            count(text_core ? "disagree_text_only" : "disagree_native_only", k);
+            return std::nullopt;
+        }
+        if (! text_core)
+            return std::nullopt;
+    } else {
+        // PRODUCT_DESIGN.md 3.3: the native classification decides
+        if (final) {
+            if (native_core)
+                count("final", k);   // warning (v2 never fills the last layer)
+            return std::nullopt;
+        }
+        if (chunk.has_arc || chunk.has_relxyz) {
+            if (native_core)
+                count("arc_g91", k);   // fatal
+            return std::nullopt;
+        }
+        if (! native_core) {
+            if (text_core)
+                count("text_only", k);   // warning, no block
+            return std::nullopt;
+        }
+        // 3.2 (a), a text skin type: counted (after gate 3b), planned
     }
-    if (! text_core)
-        return std::nullopt;
     // gate 4, 5
     const NativeLayer *nat = nullptr;
     if (! adapter_only) {
@@ -948,6 +1104,10 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
             return std::nullopt;
         }
     }
+    if (m_opts.fault == "cancel" && ! m_cancel_fired) {
+        m_cancel_fired = true;
+        throw CanceledException();
+    }
     if (m_opts.throw_if_canceled)
         m_opts.throw_if_canceled();
 
@@ -960,6 +1120,18 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
         count("no_z", k);
         return std::nullopt;
     }
+    // gate 3b (product): a native core layer whose text has no powder-kind path (every sparse path was dropped at
+    // emission) gets no block: there is nothing to replace and no oracle
+    if (product) {
+        bool any_powder = false;
+        for (const PathRec &p : model.paths) any_powder |= p.kind == "powder";
+        if (! any_powder) {
+            count("native_only_nosparse", k);
+            return std::nullopt;
+        }
+        if (! text_core)
+            ++m_stats.native_only;   // 3.2 (a)
+    }
     PowderLayerRec rec;
     rec.k  = k;
     rec.z  = *model.z;
@@ -968,6 +1140,7 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
     bool       carrier = false;
     PlanInput  in;
     PlanDebug  dbg;
+    ExPolygons S;
     const bool want_dbg = ! m_opts.dump_dir.empty();
     if (rec.h <= 0.0) {
         // gate 7: carrier, the translator gives v2's "non-positive layer height" warning
@@ -1025,11 +1198,16 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
             try {
                 if (m_opts.fault == "plan")
                     throw std::runtime_error("fault injection: plan");
-                planned = plan_powder_layer_native(in, want_dbg ? &dbg : nullptr);
+                planned = plan_powder_layer_native(in, want_dbg ? &dbg : nullptr, &S);
             } catch (const CanceledException &) {
                 throw;
             } catch (const std::exception &ex) {
                 count("plan", k, ex.what());
+                return std::nullopt;
+            }
+            // gate 10b (product): the planner found no closed wall loop (P0 / P1c)
+            if (product && planned.status == PowderLayerRec::Status::open) {
+                count("open", k);
                 return std::nullopt;
             }
             rec.status    = planned.status;
@@ -1060,9 +1238,49 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
         count("record", k, back.errors.empty() ? std::string("round trip differs") : back.errors.front().second);
         return std::nullopt;
     }
-    ++m_stats.blocks;
-    if (carrier)
-        ++m_stats.carriers;
+
+    const bool  st_ok = ! carrier && rec.status == PowderLayerRec::Status::ok;
+    const SCover cover(S);
+    const auto  in_s = [&cover](double x, double y) { return cover.covers(x, y); };
+    // gate 12: every powder-kind vertex and segment midpoint lies in S, within half an outer-wall width of its boundary
+    std::string orphan_at;
+    if (st_ok) {
+        const SCover orphan_cover(S, orphan_tolerance_nm(in.text_walls));
+        orphan_at = orphan_point(in.text_powder, orphan_cover);
+        if (! orphan_at.empty())
+            m_stats.orphan.push_back(k);   // shadow: counted only
+    }
+    const bool fatal_orphan = product && ! orphan_at.empty();
+    if (fatal_orphan)
+        count("orphan", k, orphan_at);
+
+    // gate 13 (product): suppression of the sparse infill (section 4) on st=ok chunks, verified, else released unedited
+    const std::string chunk_hash_pre = (want_dbg && st_ok) ? fnv1a64_hex(m_held) : std::string();
+    std::optional<SuppressOutcome> sup;
+    if (product && m_opts.suppress && st_ok && ! fatal_orphan) {
+        try {
+            if (m_opts.fault == "suppress")
+                throw std::runtime_error("fault injection: suppress");
+            sup = suppress_and_verify(m_held, m_held_infos, model, m_chunk_before, m_chunk_bbox_before, U.width_fallback,
+                                      m_opts.mutate, m_opts.skip_verify, in_s);
+        } catch (const std::exception &ex) {
+            sup.emplace();
+            sup->result.fallback = "exception";
+            sup->detail          = ex.what();
+            sup->applied         = false;
+        }
+        if (sup->applied) {
+            ++m_stats.suppressed;
+            m_stats.removed_moves += sup->result.removed_moves;
+            m_stats.removed_other += sup->result.removed_other;
+            m_stats.restore_lines += sup->result.restore_lines;
+            m_stats.removed_de += sup->result.removed_de;
+        } else {
+            m_stats.fallbacks[sup->result.fallback].push_back(k);
+            if (! m_fallback_what.count(sup->result.fallback))
+                m_fallback_what[sup->result.fallback] = "k=" + std::to_string(k) + ": " + sup->detail;
+        }
+    }
 
     if (want_dbg) {
         try {
@@ -1098,6 +1316,16 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
             j["debug"]  = { { "cavity", wkt(dbg.cavity) }, { "omega", wkt(dbg.omega) }, { "narrow", wkt(dbg.narrow) },
                             { "revert", wkt(dbg.revert) }, { "components", comps }, { "notes", dbg.notes } };
             j["record"] = txt;
+            // PRODUCT_DESIGN.md 2: the dump describes the unedited chunk (the native capture and the text the planner
+            // saw); these fields say what the binder did with it.
+            j["mode"]          = to_string(m_opts.mode);
+            j["suppressed"]    = sup && sup->applied;
+            j["fallback"]      = (sup && ! sup->applied) ? nlohmann::json(sup->result.fallback) : nlohmann::json();
+            j["chunk_sha_pre"] = chunk_hash_pre.empty() ? nlohmann::json() : nlohmann::json(chunk_hash_pre);
+            j["orphan"]        = orphan_at.empty() ? nlohmann::json() : nlohmann::json(orphan_at);
+            if (sup && sup->applied)
+                j["removed"] = { { "moves", sup->result.removed_moves }, { "other", sup->result.removed_other },
+                                 { "restore_lines", sup->result.restore_lines }, { "de", py_repr(sup->result.removed_de) } };
             const std::string path = (boost::filesystem::path(m_opts.dump_dir) / ("k" + std::to_string(k) + ".json")).string();
             boost::nowide::ofstream f(path, std::ios::binary | std::ios::trunc);
             const std::string s = j.dump(1);
@@ -1106,6 +1334,13 @@ std::optional<std::string> PowderShadow::finalize(const LayerChunk &chunk, bool 
             // a dump is a debugging aid; it never changes the export
         }
     }
+    if (fatal_orphan)
+        return std::nullopt;
+    ++m_stats.blocks;
+    if (carrier)
+        ++m_stats.carriers;
+    if (sup && sup->applied)
+        m_held = std::move(sup->result.lines);   // released by close_chunk (line 0 unchanged)
     return txt;
 }
 
@@ -1171,12 +1406,32 @@ void PowderShadow::finish(const Sink &sink)
         m_native.clear();
     }
     m_finished = true;
+    // PRODUCT_DESIGN.md 3.3: a powder export without any block (validation rejects the usual causes first)
+    if (m_opts.product() && m_stats.blocks == 0 && ! failed())
+        m_stats.no_core = true;
     flush(sink);
 }
 
 std::vector<std::string> PowderShadow::warnings() const
 {
     std::vector<std::string> out;
+    if (m_opts.product()) {
+        // PRODUCT_DESIGN.md 3.2: the only product-mode warnings; every other reason is a failure (failure_message)
+        if (const auto it = m_stats.reasons.find("text_only"); it != m_stats.reasons.end())
+            out.push_back("u-MEX powder: layer(s) " + k_list(it->second) +
+                          " have moves typed sparse infill but no sparse infill of the part (custom G-code or a prime tower "
+                          "inherits ;TYPE:); they are printed as paste.");
+        if (const auto it = m_stats.reasons.find("native_only_nosparse"); it != m_stats.reasons.end())
+            out.push_back("u-MEX powder: layer(s) " + k_list(it->second) +
+                          " have sparse infill in the slice but none was printed (all paths too short); they are printed "
+                          "without powder.");
+        if (const auto it = m_stats.reasons.find("final"); it != m_stats.reasons.end())
+            for (int k : it->second)
+                out.push_back("u-MEX powder: the last printed layer (k=" + std::to_string(k) +
+                              ") has sparse infill without a top surface; the last layer is never filled with powder, it is "
+                              "printed as paste.");
+        return out;
+    }
     for (const auto &[reason, ks] : m_stats.reasons) {
         if (reason == "lost_placeholder") {
             out.push_back("u-MEX native powder planner: " + std::to_string(ks.size()) +
@@ -1186,11 +1441,7 @@ std::vector<std::string> PowderShadow::warnings() const
         const char *label = reason_label(reason);
         if (label == nullptr)
             continue;   // final, arc_g91: not a fault
-        std::string list;
-        for (size_t i = 0; i < ks.size() && i < 10; ++i) list += (i ? ", " : "") + std::to_string(ks[i]);
-        if (ks.size() > 10)
-            list += ", ... (" + std::to_string(ks.size() - 10) + " more)";
-        std::string msg = "u-MEX native powder planner: " + std::to_string(ks.size()) + " core layer(s) (" + list +
+        std::string msg = "u-MEX native powder planner: " + std::to_string(ks.size()) + " core layer(s) (" + k_list(ks) +
                           ") left as paste: " + label;
         const auto it = m_first_what.find(reason);
         if (it != m_first_what.end())
@@ -1206,17 +1457,109 @@ std::vector<std::string> PowderShadow::warnings() const
     return out;
 }
 
+std::vector<std::string> PowderShadow::fallback_log() const
+{
+    std::vector<std::string> out;
+    for (const auto &[reason, ks] : m_stats.fallbacks) {
+        std::string s = "u-MEX powder: sparse infill kept in the G-code text of layer(s) " + k_list(ks) +
+                        " (suppression fallback " + reason;
+        const auto it = m_fallback_what.find(reason);
+        if (it != m_fallback_what.end() && ! it->second.empty())
+            s += ": " + it->second;
+        out.push_back(s + ")");
+    }
+    return out;
+}
+
+bool PowderShadow::failed() const
+{
+    if (! m_opts.product())
+        return false;
+    if (m_stats.disabled || m_stats.no_core)
+        return true;
+    for (const auto &[reason, ks] : m_stats.reasons)
+        if (! ks.empty() && FATAL_PRODUCT.count(reason))
+            return true;
+    return false;
+}
+
+std::string PowderShadow::failure_message() const
+{
+    if (! failed())
+        return std::string();
+    std::string msg = "u-MEX powder: the G-code export was stopped because these core layers would be printed without powder:";
+    const auto  ks_of = [this](const char *r) -> const std::vector<int> * {
+        const auto it = m_stats.reasons.find(r);
+        return it == m_stats.reasons.end() || it->second.empty() ? nullptr : &it->second;
+    };
+    const auto what_of = [this](const std::string &r) {
+        const auto it = m_first_what.find(r);
+        return it == m_first_what.end() ? std::string() : it->second;
+    };
+    if (const auto *ks = ks_of("arc_g91"))
+        msg += "\nlayer(s) " + k_list(*ks) +
+               ": arc moves (G2/G3) or relative positioning (G91) in the layer; arc fitting is off on DIW printers, so check "
+               "the custom G-code of these layers.";
+    if (const auto *ks = ks_of("open"))
+        msg += "\nlayer(s) " + k_list(*ks) + ": the outer walls do not enclose a cavity.";
+    if (const auto *ks = ks_of("orphan"))
+        msg += "\nlayer(s) " + k_list(*ks) + ": extrusions typed sparse infill lie outside the part's outer walls (first at " +
+               what_of("orphan") +
+               ")"
+               "; sparse infill must lie inside the part's outer walls (tolerance: half an outer-wall width). Possible causes: "
+               "an extrusion typed sparse infill outside the part, such as custom G-code without its own ;TYPE: line (for example "
+               "the layer change G-code) or a prime tower, or an island whose outer wall is missing.";
+    for (const char *r : { "merged_multi_core", "lost", "lost_placeholder", "capture", "no_z", "frame", "plan", "record", "sync" })
+        if (const auto *ks = ks_of(r)) {
+            const std::string w = what_of(r);
+            if (std::string(r) == "lost_placeholder")
+                // no layer number: the placeholder never reached the output
+                msg += "\ninternal error (lost_placeholder: " + std::to_string(ks->size()) +
+                       " captured layer(s) never reached the G-code output). Please report this with the 3MF.";
+            else
+                msg += "\nlayer(s) " + k_list(*ks) + ": internal error (" + r + (w.empty() ? std::string() : ": " + w) +
+                       "). Please report this with the 3MF.";
+        }
+    if (m_stats.disabled) {
+        const std::string w = what_of("binder");
+        msg += "\ninternal error (binder: " + (w.empty() ? std::string("internal error") : w) + "). Please report this with the 3MF.";
+    }
+    if (m_stats.no_core)
+        msg += std::string("\nno layer of this plate is a powder core layer (sparse infill without top or bottom surface)") +
+               (ks_of("final") ? "; the only one is the last layer, which is never filled" : "") +
+               ". Turn u-MEX powder infill off, or give the part sparse infill.";
+    return msg;
+}
+
 std::string PowderShadow::summary() const
 {
-    std::string s = "DIW shadow planner: " + std::to_string(m_stats.blocks) + " block(s), " + std::to_string(m_stats.carriers) +
-                    " carrier(s)";
-    for (const auto &[reason, ks] : m_stats.reasons) s += ", " + reason + "=" + std::to_string(ks.size());
+    const bool  product = m_opts.product();
+    std::string s = (product ? std::string("DIW powder planner (product): ") : std::string("DIW shadow planner: ")) +
+                    std::to_string(m_stats.blocks) + " block(s), " + std::to_string(m_stats.carriers) + " carrier(s)";
+    for (const auto &[reason, ks] : m_stats.reasons)
+        if (! product || (reason != "orphan" && reason != "native_only_nosparse"))
+            s += ", " + reason + "=" + std::to_string(ks.size());
     if (m_stats.disabled)
         s += ", disabled";
-    char t[160];
-    std::snprintf(t, sizeof(t), "; max_held=%d capture_ms=%.1f binder_ms=%.1f single_bead=%d", m_stats.max_held_chunks,
-                  m_stats.capture_ms, m_stats.binder_ms, m_single_bead);
-    return s + t;
+    if (product) {
+        if (m_stats.no_core)
+            s += ", no_core";
+        int nfb = 0;
+        for (const auto &[reason, ks] : m_stats.fallbacks) nfb += int(ks.size());
+        s += ", suppressed=" + std::to_string(m_stats.suppressed) + " fallback=" + std::to_string(nfb) +
+             " removed_moves=" + std::to_string(m_stats.removed_moves);
+    }
+    char t[200];
+    std::snprintf(t, sizeof(t), "; max_held=%d capture_ms=%.1f binder_ms=%.1f single_bead=%d orphan=%d", m_stats.max_held_chunks,
+                  m_stats.capture_ms, m_stats.binder_ms, m_single_bead, int(m_stats.orphan.size()));
+    s += t;
+    if (product) {
+        const auto it = m_stats.reasons.find("native_only_nosparse");
+        s += " native_only=" + std::to_string(m_stats.native_only) +
+             " native_only_nosparse=" + std::to_string(it == m_stats.reasons.end() ? 0 : int(it->second.size())) +
+             " removed_de=" + py_repr(m_stats.removed_de);
+    }
+    return s;
 }
 
 } // namespace DIW

@@ -178,7 +178,7 @@ def main(argv):
             rep.check(f"{name}.accept_stub", ok, f"exit {rc}" + (f": {err}" if rc else ""))
             if ok:
                 trv = os.path.join(work, f"{name}.v2rec.stub.gcode")
-                rc2, _ = run(exe, ["--config-from-gcode", "--stub-powder-stage", v2_path, trv] + ovs)
+                rc2, _ = run(exe, ["--config-from-gcode", "--v2-parity", "--stub-powder-stage", v2_path, trv] + ovs)
                 if rc2 == 0:
                     totals["stub_cases"] += 1
                     totals["stub_same"] += open(trs, "rb").read() == open(trv, "rb").read()

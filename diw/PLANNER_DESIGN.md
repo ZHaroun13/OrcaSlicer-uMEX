@@ -654,6 +654,17 @@ Every stage ends with a checkpoint that must pass before the next stage starts.
 - **Post-processing.** `GCodeProcessor::finalize` post-processing (M73, pre-heat) must never insert a G0-G3 between a start marker and a block. T2(b) guards this on every slice and printer profile in the corpus.
 - **Lost placeholders.** A future pipeline filter that drops comment lines would lose placeholders. The binder counts `lost`, and the T2 matrix includes PE, FanMover, cooling and PA.
 - **Classification disagreements** (for example sparse infill that is only arc-fitted, or roles inherited from custom G-code through a modal `;TYPE:`) are reported and not converted in shadow mode. Increment 5 must resolve them before native classification becomes the authority.
+  **Closed by increment 5 (19 Nov 2026, [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md) 3.2-3.4).** The native classification is the authority in product mode, and each class has a defined outcome:
+  - `text_only`: no block, a warning.
+  - `native_only` (a): a block.
+  - `native_only` (b): no block, a warning, counted `native_only_nosparse`.
+  - Final layer: a warning.
+  - Arcs / G91 in a native core layer: the export fails (`arc_g91`).
+  - A sparse-typed extrusion outside the walls: the export fails (`orphan`).
+  - Objects that disagree on one layer: not core, as in v2.
+
+  The arc-fitted case had already been fixed in increment 4. Measured (POWDER_PLAN.md "Increment 5 results"): the disagreement counter is 0 on all 228 matrix / stress / T5 / coverage slices (G2), and G4 reproduces each class on purpose-built plates. `text_only` and `native_only` (a) are reproduced in product and shadow mode; `tall_short` and `final_core` agree with v2. `native_only` (b) could not be reached by a slice and is covered by the Catch2 T12 stream.
+- **Lost placeholders, frame, sync** (above): still counted the same way in shadow mode. In product mode, increment 5 makes `lost`, `lost_placeholder`, `frame`, `sync` and the other internal reasons stop the export with an "internal error" line (PRODUCT_DESIGN.md 5.1). The G5 fault injections test this, and none occurs on the 228 slices.
 - **ra tolerances.** The ra tolerance may need tuning on sharp-tip parts (notch, cone) because of D4 and D7. Tune only with a logged justification.
 
 ---

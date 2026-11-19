@@ -236,7 +236,8 @@ def main(argv):
         report["cases"][name] = {"status": status, "detail": detail}
         print(f"{status:4} {name}: {detail}")
 
-    flags = ["--config-from-gcode"] + (["--stub-powder-stage"] if stub else [])
+    # the records are v2's: v2_parity keeps v2's st=open behaviour (PRODUCT_DESIGN.md 5.3)
+    flags = ["--config-from-gcode", "--v2-parity"] + (["--stub-powder-stage"] if stub else [])
     inputs = []
     for path in corpus:
         with open(path, "rb") as fh:
@@ -387,7 +388,7 @@ def main(argv):
                 with open(p_in, "wb") as fh:
                     fh.write(body)
                 p_out = p_in.replace(".gcode", ".out.gcode")
-                rc, err = run_cpp(exe, ["--config-from-gcode", "--stub-powder-stage", p_in, p_out, "diw_powder_infill=1"] + ov,
+                rc, err = run_cpp(exe, ["--config-from-gcode", "--v2-parity", "--stub-powder-stage", p_in, p_out, "diw_powder_infill=1"] + ov,
                                   p_in.replace(".gcode", ".log"))
                 missing = [n for n in needles if n not in err]
                 if rc == 3 and not missing:

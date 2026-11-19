@@ -1300,8 +1300,10 @@ bool is_ring_loop(int inset_idx, const std::vector<ExtrusionRole> &path_roles)
 
 // ------------------------------------------------------------------------------------------------ the planner
 
-PowderLayerRec plan_powder_layer_native(const PlanInput &in, PlanDebug *dbg)
+PowderLayerRec plan_powder_layer_native(const PlanInput &in, PlanDebug *dbg, ExPolygons *s_out)
 {
+    if (s_out)
+        s_out->clear();
     if (in.U == nullptr)
         throw std::invalid_argument("plan_powder_layer_native: no parameters");
     const UMexParams &U = *in.U;
@@ -1372,6 +1374,10 @@ PowderLayerRec plan_powder_layer_native(const PlanInput &in, PlanDebug *dbg)
         return rec;
     }
     const OutsideTest outside_S(S);
+    if (s_out) {
+        *s_out = S;
+        translate(*s_out, origin);   // back to the G-code frame (exact integer translation)
+    }
 
     lap("P01");
     // ---- P2 / P3: band, paste exclusion, cavity --------------------------------------------------------

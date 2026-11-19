@@ -20,6 +20,7 @@
 #include "../Polygon.hpp"
 
 #include "DIWPowderPlanner.hpp"
+#include "DIWTranslator.hpp"   // DIW::ExtrusionBBox
 #include "DIWUMexSequencer.hpp"
 
 #include <cstdint>
@@ -75,13 +76,26 @@ struct NativeLayer
 
 struct ShadowOptions
 {
+    // PRODUCT_DESIGN.md 2. shadow: increment 4 exactly (gate 3 agreement, no suppression, warnings only). product:
+    // the native classification decides, a native core layer without a valid block is a failure (failed()), and the
+    // sparse infill of every st=ok core chunk is suppressed (section 4). The struct default is shadow (the T8 unit
+    // streams keep their increment-4 meaning); from_env() defaults to product.
+    enum class Mode { shadow, product };
+    Mode           mode        = Mode::shadow;
+    // Product mode: suppress the sparse infill of st=ok core chunks (ORCA_DIW_TEST_NO_SUPPRESS=1 clears it).
+    bool           suppress    = true;
+    // Test only: a deliberately wrong edit (ORCA_DIW_TEST_SUPPRESS_MUTATE), and the release of the edit without
+    // V0-V3 (ORCA_DIW_TEST_SKIP_VERIFY=1).
+    SuppressMutate mutate      = SuppressMutate::none;
+    bool           skip_verify = false;
     // Offline replay: a chunk without placeholders is planned from its text (text-only adapter).
     bool        text_only = false;
     // Keep the ";DIWP" lines in the output (ORCA_DIW_SHADOW_KEEP_PLACEHOLDERS=1; replay debugging only).
     bool        keep_placeholders = false;
     // Write k<k>.json per block into this directory (ORCA_DIW_SHADOW_DUMP).
     std::string dump_dir;
-    // Test-only fault injection (ORCA_DIW_SHADOW_FAULT): "capture", "plan" or "binder".
+    // Test-only fault injection (ORCA_DIW_SHADOW_FAULT): "capture", "plan", "binder", "suppress" (the suppression
+    // throws: a counted fallback, product mode) or "cancel" (CanceledException from the first core chunk's finalize).
     std::string fault;
     // Decimals of the XY axes in the G-code (3, or 4 with high-precision G-code): frame self-check tolerance.
     int         xy_decimals = 3;
@@ -92,9 +106,18 @@ struct ShadowOptions
     // text and passes through unchanged.
     std::string placeholder_token;
 
-    // keep_placeholders, dump_dir and fault from the environment variables above.
+    // From the environment: mode (ORCA_DIW_POWDER_MODE: unset or "product" -> product, "shadow" -> shadow),
+    // suppress (ORCA_DIW_TEST_NO_SUPPRESS), mutate, skip_verify, keep_placeholders, dump_dir and fault. Throws
+    // std::invalid_argument for an unknown ORCA_DIW_POWDER_MODE or ORCA_DIW_TEST_SUPPRESS_MUTATE value.
     static ShadowOptions from_env();
+    bool product() const { return mode == Mode::product; }
 };
+const char *to_string(ShadowOptions::Mode m);
+
+// Why a u-MEX powder job cannot be planned on this print, or "" (PRODUCT_DESIGN.md 5.1 / 6.3): BBL printer G-code,
+// spiral vase, G-code axis remap, belt printer, or extruders with differing extruder_offset values. The kill switch
+// is not a reason here (PowderShadow::create checks it first). Shared by PowderShadow::create and Print::validate.
+std::string powder_refusal_reason(const DynamicPrintConfig &full, bool bbl_printer, bool spiral_vase, bool axis_remap);
 
 class PowderShadow
 {
@@ -143,10 +166,20 @@ public:
     // End of the text: the held chunk is final, a partial last line is released.
     void finish(const Sink &sink);
 
-    // Aggregated warnings (section 8), for active_step_add_warning.
+    // Aggregated warnings (section 8), for active_step_add_warning. Product mode (PRODUCT_DESIGN.md 3.2 / 5.1): only
+    // text_only, native_only_nosparse and final; the failures are in failure_message().
     std::vector<std::string> warnings() const;
-    // One log line with the counters.
+    // One log line with the counters (PRODUCT_DESIGN.md 5.2).
     std::string              summary() const;
+    // Product mode: one log line per suppression fallback reason (k list and the first detail). Empty in shadow mode.
+    std::vector<std::string> fallback_log() const;
+    // Product mode (PRODUCT_DESIGN.md 5.1): a core layer would be printed without powder (a fatal reason was
+    // recorded, the binder was disabled, or the export has no block at all). Always false in shadow mode, and
+    // never true because of a suppression fallback. Final after finish().
+    bool                     failed() const;
+    // The export-stopping message of 5.1 ("" when not failed()).
+    std::string              failure_message() const;
+    const ShadowOptions     &options() const { return m_opts; }
 
     struct Stats
     {
@@ -157,6 +190,14 @@ public:
         double capture_ms = 0.;                  // time spent in capture() (T10)
         double binder_ms = 0.;                   // time spent in feed / sync / finish, planner included (T10)
         std::map<std::string, std::vector<int>> reasons;   // gate reason -> k list
+        // PRODUCT_DESIGN.md 3.4 / 4 / 5.2
+        std::vector<int> orphan;                 // st=ok chunks with a powder-kind point outside S (shadow: counted only)
+        int    native_only = 0;                  // product: native core layers whose text has a skin type (3.2 (a))
+        int    suppressed = 0;                   // product: st=ok chunks released edited
+        std::map<std::string, std::vector<int>> fallbacks;   // product: suppression fallback reason -> k list
+        int    removed_moves = 0, removed_other = 0, restore_lines = 0;
+        double removed_de = 0.;                  // sum of the removed moves' dE (G8)
+        bool   no_core = false;                  // product: the export ended without any block
     };
     const Stats &stats() const { return m_stats; }
 
@@ -190,9 +231,15 @@ private:
     int                       m_held_chunk = -1;      // chunk index of the held lines (T10 counter)
     int                       m_held_nchunks = 0;
     double                    m_prev_z = 0.0;
+    // The scanner state and the extruded-bbox state (translator rule) before the held chunk's line 0 (4.4).
+    ScanState                 m_chunk_before;
+    ExtrusionBBox             m_bbox;                 // fed with every line before the config block, in file order
+    ExtrusionBBox             m_chunk_bbox_before;
+    bool                      m_cancel_fired = false; // fault "cancel" fires once
 
     Stats                     m_stats;
     std::map<std::string, std::string> m_first_what;   // reason -> first message
+    std::map<std::string, std::string> m_fallback_what; // fallback reason -> first detail
 
     void handle_line(std::string &&line, bool &consumed);
     void release(std::string_view line);                // drops ";DIWP" lines unless kept

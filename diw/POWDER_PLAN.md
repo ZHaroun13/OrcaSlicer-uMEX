@@ -30,7 +30,7 @@ needed until milestone 5.
 | 3a | Sequencing from records: S1, S2 wipe, S3 UV, S5 compaction, S6 (milestone 3); S4 stubbed on both sides (`GCode/DIWUMexSequencer`, `compare_sequencer.py`) | **done** |
 | 3b | S4 powder emission from records (milestone 4); byte-identical with v2's own plans as records on all fixtures | **done** |
 | 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | **done** (18 Nov 2026): built and verified on the 191-slice matrix, T5 and the 10.1 stress variants; see "Increment 4 results" |
-| 5 | Product path: sparse infill suppressed on core layers, translator requires valid records, `seam_slope_type` forced off, validation rules | |
+| 5 | Product path: sparse infill suppressed on core layers, translator requires valid records, `seam_slope_type` forced off, validation rules | **done** (19 Nov 2026): product mode is the export default; its translated output equals shadow mode's on 228 slices; see "Increment 5 results" |
 | 6 | Added time and powder mass reported at export; documentation | |
 | 7 | Milestone 5 (one full rebuild): preview / time estimate read the records, Powder role colour | |
 
@@ -362,9 +362,114 @@ The details are in that file's Deviations section.
 - The prime-tower variant uses `wipe_tower_type = type1` and a `;TYPE:Prime tower` tag. Upstream WipeTower2 crashes
   with one tool.
 
+## Increment 5 results (19 Nov 2026)
+
+Design: [PRODUCT_DESIGN.md](PRODUCT_DESIGN.md) (its Deviations section lists every choice made while building it).
+The native planner is now the product path:
+- **Authority.** The native classification decides which layers are core layers (per printed layer, as v2). A core
+  layer gets a block only if its text has at least one sparse-infill path.
+- **Suppression.** On every `st=ok` layer the binder removes the sparse-infill paths (and their `pre_lines`) from
+  the exported G-code after planning, adds the minimal restore lines (position, feed, `G92 E`, width, end-of-chunk
+  type), and checks before release that the translator's emission trace, the end scanner state and the extruded
+  bounding box are unchanged (V0-V3). If a check fails, the layer is released unedited and counted as a fallback.
+  The preview and time estimate no longer contain the suppressed sparse infill. `st=small` layers, carriers and
+  non-core layers are never edited.
+- **Strictness.** A native core layer that would be printed without powder stops the export with a message listing
+  the layers: `arc_g91`, `open`, `orphan`, the internal-error reasons and `no_core`. The binder's refusal reasons
+  (spiral vase, BBL, belt / axis remap, extruder offsets) stop it too. `text_only`, `native_only_nosparse` and the
+  final layer only warn. The translator refuses a powder job with no `;DIW:` records, and a non-carrier `st=open`
+  block, unless `--v2-parity` is given.
+- **Validation.** `Print::validate` runs `diw_validate`, which gives v2's hard-limit messages verbatim (the opt_key
+  comes from an explicit table) and v2's soft warnings. Three product rules have no v2 counterpart: `wall_loops = 0`,
+  no sparse infill on any region, and `infill_combination`. Other rules: the structural refusals, a per-object scarf
+  seam, and the three retraction warnings. `seam_slope_type` is forced to none on powder jobs.
+- **Modes and test switches** (environment only, no new config key): `ORCA_DIW_POWDER_MODE=shadow` gives
+  increment 4 byte for byte. The other switches are `ORCA_DIW_TEST_NO_SUPPRESS`, `..._SKIP_VALIDATE`,
+  `..._KEEP_SCARF`, `..._SUPPRESS_MUTATE`, `..._SKIP_VERIFY`, and the `suppress` / `cancel` faults.
+  `diw_translate` gained `--v2-parity`, `--validate`, and `--plan-records --product [--no-suppress]`.
+  `--plan-records` stays shadow by default.
+
+Final build: `build_slicer_diw.ps1 --no-configure`, `SLICER EXIT CODE 0`, `OrcaSlicer.dll` 19 Nov 12:47:23,
+`diw_translate.exe` 12:55:50, `diw_planner_tests.exe` 12:57:51 (fix-pass build, see below). Python
+3.15.0 with shapely 2.2.0 and GEOS 3.14.1; v2 unmodified.
+
+| Gate | Scope | Result |
+|---|---|---|
+| T0 regression | 5 corpus files, after every stage | `compare_sequencer.py` 157 ok with and without `--stub-s4`, `compare_records.py` 486 ok, `compare_powder.py` and `compare_v2.py` 0 failures; 0 skips; unchanged in all 7 stages. |
+| Catch2 | `diw_planner_tests` | 4628 assertions in 50 test cases. Included: T11 `suppress_sparse` (168 assertions, 11 cases, mutations among them), T12 product binder streams (174 assertions, 8 cases), T13 `diw_validate` / translator `v2_parity`, and T8 unchanged (3233 assertions, 11 cases). |
+| T7 non-interference | non-DIW (scarf on and off), DIW paste-only (scarf on and off, translated), 13 kill-switch exports | 32 checks, 0 failures: byte-identical to the pre-increment build; the scarf stays where it is not a powder job. |
+| S0 shadow mode unchanged | 191 matrix + 16 stress + T5 + coverage, `ORCA_DIW_POWDER_MODE=shadow` | Every export is byte-equal to its increment-4 reference after `norm` (slice-only `on` 191/191; T2 `on` / `kill` / `keep` 574; stress 49; T5 16; coverage 16). The T2 pass gives 25516 checks (the increment-4 25515 plus the S0 assertion), stress 2622, T5 1151, coverage 441, all with 0 failures. There are 0 native non-carrier `st=open` blocks. |
+| G1 product = shadow after translation | 228 slices (191 matrix, 16 stress, 16 T5 exports, 5 coverage) | 2307 checks, 0 failures. The records are byte-equal. The translations are byte-equal after `norm` and the frozen mask (`M73 P R` lines; 9 statistics lines outside the layers). The 2 policy=error stress slices abort with the same message. Suppressed chunks = `st=ok` blocks: 3153 matrix, 333 stress, 336 T5, 39 coverage. Fallbacks: 0. |
+| G1 (d) `disable_m73 = 1` | 13 `classic.base` + 16 stress + 5 coverage | 599 checks, 0 failures; no `M73` line; translations equal with only the statistics mask. |
+| G2 authority alone | the 228 slices with `ORCA_DIW_TEST_NO_SUPPRESS=1` | 2303 checks, 0 failures. Each export equals the shadow export after `norm`, and the disagreement counter is 0 on every slice. |
+| G3 the edit is the specified one | the 228 slices | 1140 structural checks, 0 failures (in the G1 count). Coverage counters: 20 FB lines, 20 edited chunks with FB on 3 slices, 13 `st=small` blocks, 13 of 13 unedited. |
+| G4 disagreement classes | 12 CLI exports (6 plates, product and shadow) + the T2 checks of the custom-G-code-free plates | 82 checks, 0 failures; T2 on `g4_slices.json` (tall_short, tall_short_precise, final_core) 754 checks, 0 failures. Details below. |
+| G5 refusals and safety nets | 21 CLI exports + translator cases | 78 checks, 0 failures. Every refusal gives its exact message and leaves no plate and no `.tmp` file. Cancel never shows the failure list. The `suppress` fault releases every chunk unedited with an identical translation. The strict translator accepts `st=small` and the h <= 0 carrier and refuses the no-plan export and v2's `st=open` records. |
+| G6 validation | `product_validate.py` (CLI) and `diw_translate --validate` | 117 checks, 0 failures (three new density rows; `--selftest` 4 checks). Validation gives v2's message verbatim at the 1e-9 boundaries; the 14 rows that `PrintConfig.cpp`'s ranges reject first are checked as a CLI refusal plus `--validate` plus Catch2. |
+| G11 shipped in-slicer translation | per set one G1 slice (untranslated export vs the shipped translated export) + the G5 refusals | 47 checks, 0 failures: the shipped path equals `translate(product)` after `norm`; refusals identical. |
+| G7 performance | cube25, cone (best of 5) | 1.125x and 1.130x the kill-switch time (limit 1.2x); `max_held` = 1. |
+| G8 processor consistency | 228 G1 + 228 G2 + 34 G1 (d) product exports | `filament used [mm]` = shadow - `removed_de` within 0.01 mm on every export (largest difference 0.0081 mm, 1164 checks for the G1 set); the estimated time is never larger. |
+| G9 offline product replay | 191 fx_t2b + 16 fx_st + 5 coverage keep files | 3197 checks, 0 failures; fallbacks 0. |
+| G10 gate-level mutation | 3 matrix slices + 1 coverage FB slice x 3 mutations | 160 checks, 0 failures. With verification on, every `st=ok` chunk falls back and the output is unchanged. With `ORCA_DIW_TEST_SKIP_VERIFY=1`, G3 and G1 fail on all 12 runs. |
+| Final samples (stage 7) | S0: `cube25.classic.*` (11 slices) + coverage; G1: every `classic.` slice (127) | S0 2669 checks, 0 failures (241 per slice, as in fx_t2b), exports equal to fx_t2b 33/33; coverage 441, 0 failures; G1 1297 checks, 0 failures. |
+
+**Fix pass (review findings F1-F4), all verified on the final build:**
+- F1: `product_validate.py` G6 rows `R.*` take the refused_elsewhere branch only when Orca's own validate error is
+  present; `--selftest` (4 checks) proves it.
+- F2: new gate G11 (`product_gate.py g11`) runs the shipped in-slicer translation (no `ORCA_DIW_EXPORT_UNTRANSLATED`)
+  and compares with `translate(product)`; the harnesses gained an `untranslated` switch.
+- F3: gate 12 (orphan) uses a tolerance of max(10 um, half the widest outer / overhang wall width) and its message no
+  longer blames custom G-code; Catch2 T12 covers overshoot 9.5 / 9.45 (accepted) and 9.0 (orphan) in both modes.
+- F4: `Print::validate` rejects `sparse_infill_density >= 100%` with a clear message (G6 rows density100 / 100_one / 99).
+- Final numbers: Catch2 4628 / 50; T0 157 / 157 / 486 / 0 / 0 (with and without `--stub-s4`); S0 T2 25516, stress
+  2622, T5 1151, coverage 441, exports equal to the references 574 / 49 / 16 / 16; G1 2307; G2 2303; G1 (d) 599;
+  G4 82; G5 78; G6 117; G7 8 (1.125x / 1.130x); G8 1164; G9 3197 (fallbacks 0); G10 160; G11 47; T7 32.
+- Open decision: `ov60_w1` (an overhang wall at 60 deg, one wall) now falls back to paste via `v2_bbox`; legal and
+  safe, but the native planner and v2 disagree on whether it is powder-capable.
+
+**G4, the disagreement classes** (`product_gate.py g4`, cube25 with the flat DIW profiles):
+- `text_only`: the layer change G-code (`{if layer_num == 1}`) adds an extrusion outside the part typed `;TYPE:Sparse
+  infill` on k = 2, an internal-solid-only layer. v2's text classification makes k 2 a core layer. Product mode
+  writes no block there and gives exactly one warning (`layer(s) 2 have moves typed sparse infill ...`), with
+  `text_only=1`. Shadow mode counts `disagree_text_only=1`. In both modes the other 32 blocks are byte-equal to
+  the plain plate's.
+- `native_only` (a): the same extrusion typed `;TYPE:Top surface` on every layer. The custom move first goes to the
+  layer's z, because a record's z is the chunk's first extruding move's z. Product mode writes 32 blocks
+  byte-equal to the plain plate's, counted `native_only=32`, with no warning. Shadow mode writes no block and
+  counts `disagree_native_only=32`.
+- `native_only` (b): a search found no slice where every printed sparse path is dropped while the sparse role
+  exists. It tried 25 x w x 10 mm boxes (w 5.7-8.0 mm, 0.01 mm steps near the transition), densities 5/15/40 %,
+  `minimum_sparse_infill_area` 15 and 0, and thin rings. The sparse role and the printed sparse paths appear at the
+  same width. So the Catch2 T12 stream covers this class (25 assertions, run by G4).
+- `tall_short` (cube25 + 10 mm cube, `precise_z_height = 0` so that the cubes share layers): k 14 holds the short
+  cube's top surface and the tall cube's sparse infill. It has no block in either mode, and k 13 (internal solid +
+  sparse) has one. The `tall_short_precise` variant (the profile's `precise_z_height = 1`) gives the short cube its
+  own z values: 35 blocks, none on a skin layer. In both variants v2 agrees: the same text-core k set, the same
+  planned (k, st), and the same BEGIN lines and RUN / FB counts. The T2 tolerance checks also pass (234 and 262
+  checks).
+- `final_core` (`top_shell_layers = 0`): k 36 has sparse infill and no block. The product warning is `the last
+  printed layer (k=36) ...` and shadow mode counts `final=1`. There are 33 blocks, product = shadow, and v2 agrees
+  (248 T2 checks).
+- Profile check: no file in `resources/profiles` has a `diw_*` key (no DIW printer profile is shipped). None of the
+  30 in-layer custom G-code values of the two test profiles extrudes. The start G-code extrudes before the first
+  layer, under Orca's `;TYPE:Custom`.
+
+Logs are in the session scratchpad `product/`: `progress/stage1.md` ... `stage7.md` (every measured number with
+its log path), `t0_s1` ... `t0_s7` (T0), `s1` (T7, G6, coverage), `s2` (T11), `s3` (T12, G9), `s4` (G5, G6, T7),
+`s5` (S0, G1, G3, G10, G5 rerun), `s6` (G2, G1 (d), G7, G8) and `s7` (G4, samples).
+
 ## Open questions (current defaults keep v2 parity)
 
 - Generated XY travel feed: v2 constant 3000 mm/min (used now) or Orca's travel speed?
 - Soft limits: unconfigured with a warning (as v2, used now) or derived from the bed size?
 - Explicit bottom/top layer counts (requirement 4.1) vs automatic role-based classification (used now).
-- Several objects on a plate: per-object classification (native planner) vs v2's per-G-code-layer.
+- Several objects on a plate (PRODUCT_DESIGN.md Q1): classification per printed layer (used now, v2: one object
+  with a top or bottom surface makes the whole layer non-core) or per object (the sparse object gets powder, the
+  other object's sparse infill becomes FB paste; no record change needed, but no v2 oracle). G4 `tall_short`
+  shows the current behaviour.
+- Retractions longer than the DIW limit (Q2): a validation warning while the translator drops them as v2 does
+  (used now), or a validation error?
+- Last printed layer with sparse infill and no top surface (Q3): printed as paste with a warning (used now; v2 never
+  fills the last layer), or an error?
+- `infill_combination` on a powder job (Q4): a validation error (used now), or forced off silently like the scarf
+  seam?

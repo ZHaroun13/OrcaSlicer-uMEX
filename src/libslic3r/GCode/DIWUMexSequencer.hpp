@@ -59,10 +59,29 @@ bool truthy(const std::optional<double> &v);
 
 // Streaming form of scan_gcode: one line at a time, in file order. Its state is the modal state of the
 // scan (position, E, M82/M83, G90/G91, feed, ;TYPE:, ;WIDTH:). scan_gcode is step() over every line.
+// The modal state of the scan after a line (PRODUCT_DESIGN.md 4.3 / 4.4: the suppression compares and seeds it).
+struct ScanState
+{
+    double x = 0., y = 0., z = 0., e = 0.;
+    bool   rel = false, absxyz = true;
+    double feed = 1200.;
+    std::string ftype;
+    std::optional<double> width;
+};
+// The state after the line li was scanned.
+ScanState scan_state_after(const LineInfo &li);
+// Field-by-field equality, doubles bit for bit. *what (if given) receives the first differing field.
+bool same_scan_state(const ScanState &a, const ScanState &b, std::string *what = nullptr);
+
 class GCodeScanner
 {
 public:
-    LineInfo step(const std::string &raw);
+    GCodeScanner() = default;
+    // Seeded with the state before the first line it will be fed (for example the state before a chunk).
+    explicit GCodeScanner(const ScanState &s)
+        : x(s.x), y(s.y), z(s.z), e(s.e), rel(s.rel), absxyz(s.absxyz), feed(s.feed), ftype(s.ftype), width(s.width) {}
+    LineInfo  step(const std::string &raw);
+    ScanState state() const { return { x, y, z, e, rel, absxyz, feed, ftype, width }; }
 
 private:
     double x = 0., y = 0., z = 0., e = 0.;
@@ -122,6 +141,7 @@ struct PathRec
     std::vector<std::pair<double, double>> points;
     std::vector<double> seg_de, seg_feed;
     std::vector<std::string> seg_raw;   // empty for a synthetic (fallback) path
+    std::vector<size_t> seg_lines;      // line index of each segment (parallel to seg_raw; empty for a synthetic path)
     // ;WIDTH: of each segment (the width rule of the path's first segment, applied per segment). v2 has no such
     // field and uses `width` (the first segment's) for the whole path; the native planner also uses this.
     std::vector<double> seg_width;
@@ -140,6 +160,81 @@ struct LayerModel
 
 LayerModel parse_core_layer(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos,
                             const LayerChunk &chunk, double width_fallback);
+
+// ------------------------------------------------------------------------------------------------
+// Sparse infill suppression (PRODUCT_DESIGN.md 4.3 / 4.4): the binder's text edit of an st=ok core chunk.
+// ------------------------------------------------------------------------------------------------
+
+struct ExtrusionBBox;   // DIWTranslator.hpp (the translator's UV-centre rule)
+
+// One item of what UMexSequencer::convert_core_layer reads from a core layer (its "emission trace"):
+// header[0], <S1>, header[1..], per wall / paste path: its pre_lines, (points[0], travel_feed), per segment
+// (raw, de, feed); the tail lines; model.z; model.z_feed. Doubles compare bit for bit.
+struct TraceItem
+{
+    enum class Kind { line, s1, path_start, seg, z, z_feed };
+    Kind        kind = Kind::line;
+    std::string text;           // line: the raw line; seg: the raw extruding line
+    double      a = 0., b = 0.; // path_start: x, y; seg: de, feed; z / z_feed: the value
+    double      c = 0.;         // path_start: travel_feed
+    bool        has = true;     // path_start: travel_feed set; z / z_feed: value set
+};
+bool        operator==(const TraceItem &l, const TraceItem &r);
+inline bool operator!=(const TraceItem &l, const TraceItem &r) { return ! (l == r); }
+std::string describe(const TraceItem &t);
+
+// The flat emission trace of a parsed core layer (lines: the text the model was parsed from).
+std::vector<TraceItem> core_emission_trace(const LayerModel &model, const std::vector<std::string> &lines);
+
+// Test hook (ORCA_DIW_TEST_SUPPRESS_MUTATE): a deliberately wrong edit, which V1 / V2 must catch.
+//  drop_restore: no restore line is written; extra_delete: the chunk's last kept extruding move is deleted too;
+//  wrong_g92: the end-of-chunk group's R3 is written as "G92 E<e + 1>"; when that group writes no R3 (relative E,
+//  or E already equal), "G92 E<e + 1>" is added after the last line. Either way the chunk ends with a wrong E.
+enum class SuppressMutate { none, drop_restore, extra_delete, wrong_g92 };
+SuppressMutate suppress_mutate_from_string(const std::string &s);   // "" -> none; unknown -> std::invalid_argument
+const char    *to_string(SuppressMutate m);
+
+struct SuppressResult
+{
+    std::vector<std::string> lines;        // the edited chunk (line 0 = the start marker, unchanged)
+    int    removed_moves = 0, removed_other = 0, restore_lines = 0;
+    double removed_de = 0.;                // sum of the removed moves' de
+    std::string fallback;                  // non-empty: not applied (lines empty), the reason
+};
+
+// The edit of 4.3. lines / infos: the chunk (line 0 its start marker), infos from the whole-file scan (each the
+// state after its line); model = parse_core_layer(lines, infos, [0, n), ...). Removes every powder-kind path's
+// extruding lines and pre_lines and writes the restore lines R1 (position), R2 (feed), R3 (G92 E, absolute E only),
+// R5 (";WIDTH:" on a "G1 F" line) after each removed group that held a move, and once more after the last line,
+// where R4 (";TYPE:" on a "G1 F" line) also restores the modal type. A removed group of comment / command lines
+// only (for example a ";WIDTH:" inside the previous path) defers its restore to the next point where a motion line
+// cannot join two paths. Fallbacks: label_in_sparse, leading_abs_e, no_trav_f, z_only, relxyz, marker, no_newline,
+// token, state.
+SuppressResult suppress_sparse(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos, const LayerModel &model,
+                               SuppressMutate mutate = SuppressMutate::none);
+
+// The checks of 4.4 on an edit. orig / orig_infos / orig_model as given to suppress_sparse; before: the scan state
+// before line 0 (orig_infos must be its continuation); bbox_before: ExtrusionBBox state before line 0. in_s: V3's
+// predicate "the point lies in S (or within the tolerance of its boundary)"; empty -> V3 skipped. Returns "" when
+// V0-V3 hold, else the reason (v0_marker, v0_chunks, v0_no_extrusion, v0_powder_left, v1_trace, v2_state, v2_chunk,
+// v2_bbox, v3_outside); *detail receives the first difference.
+std::string verify_suppression(const std::vector<std::string> &orig, const std::vector<LineInfo> &orig_infos,
+                               const LayerModel &orig_model, const std::vector<std::string> &edited, const ScanState &before,
+                               const ExtrusionBBox &bbox_before, double width_fallback,
+                               const std::function<bool(double, double)> &in_s = {}, std::string *detail = nullptr);
+
+// suppress_sparse + verify_suppression (unless skip_verify), never throws: an exception or a failed check gives
+// the original lines back with fallback set ("exception" / the verification reason).
+struct SuppressOutcome
+{
+    SuppressResult result;   // result.lines: the lines to release (the edit, or the original on a fallback)
+    bool           applied = false;
+    std::string    detail;
+};
+SuppressOutcome suppress_and_verify(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos,
+                                    const LayerModel &model, const ScanState &before, const ExtrusionBBox &bbox_before,
+                                    double width_fallback, SuppressMutate mutate = SuppressMutate::none, bool skip_verify = false,
+                                    const std::function<bool(double, double)> &in_s = {});
 
 // v2 resolve_powder_feed. Throws DIWConfigError for policy "error" (v2 message).
 struct PowderFeed
@@ -194,8 +289,10 @@ class UMexSequencer
 public:
     using Lines = std::vector<std::string>;
 
-    UMexSequencer(const TranslatorParams &p, bool stub_powder_stage)
-        : P(p), warnings(p.config_warnings), m_stub_powder_stage(stub_powder_stage) {}
+    // v2_parity (DIWTranslateOptions::v2_parity, tests only): a non-carrier st=open block leaves its layer as paste
+    // with v2's warning. Without it (production, PRODUCT_DESIGN.md 5.3) such a block stops the translation.
+    UMexSequencer(const TranslatorParams &p, bool stub_powder_stage, bool v2_parity = false)
+        : P(p), warnings(p.config_warnings), m_stub_powder_stage(stub_powder_stage), m_v2_parity(v2_parity) {}
     virtual ~UMexSequencer() = default;
 
 protected:
@@ -246,6 +343,7 @@ private:
     };
 
     bool                  m_stub_powder_stage;
+    bool                  m_v2_parity = false;
     std::optional<double> m_file_z_feed;
     std::vector<std::pair<std::string, LimitHit>> m_limit_hits;   // insertion order, as v2's dict
     std::vector<std::pair<std::string, AggRec>>   m_agg;

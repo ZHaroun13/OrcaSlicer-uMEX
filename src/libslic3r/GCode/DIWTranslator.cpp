@@ -292,6 +292,120 @@ DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &c)
     return p;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Validation before slicing (PRODUCT_DESIGN.md 6.2)
+// ------------------------------------------------------------------------------------------------
+
+const std::vector<std::pair<std::string, std::string>> &diw_validation_opt_key_table()
+{
+    // {prefix of the message read_umex_params / diw_read_translator_params gives -> fork key}, in v2's check order
+    // (diw_engine.py UMexParams.from_config). Each prefix ends with the character after the v2 key, so no row is a
+    // prefix of another row's messages.
+    static const std::vector<std::pair<std::string, std::string>> table = {
+        { "compaction_duration ",                    "diw_compaction_time" },
+        { "powder_hatch_spacing ",                   "diw_powder_hatch_spacing" },
+        { "powder_mass_flow_rate ",                  "diw_powder_mass_flow" },
+        { "powder_tap_density ",                     "diw_powder_tap_density" },
+        { "powder_fill_multiplier ",                 "diw_powder_fill_multiplier" },
+        { "powder_f_max ",                           "diw_powder_speed_max" },
+        { "powder_nozzle_dia ",                      "diw_powder_nozzle_diameter" },
+        { "powder_lag_on ",                          "diw_powder_lag_on" },
+        { "powder_lag_off ",                         "diw_powder_lag_off" },
+        { "shell_powder_clearance ",                 "diw_shell_powder_clearance" },
+        { "compaction_settle_dwell ",                "diw_compaction_settle_time" },
+        { "powder_travel_hop_mm ",                   "diw_powder_travel_hop" },
+        { "compaction_z_hop_mm ",                    "diw_compaction_z_hop" },
+        { "compaction_interval ",                    "diw_compaction_interval" },
+        { "powder_motor_voltage ",                   "diw_powder_motor_voltage" },
+        { "digital output pins must be distinct: ", "diw_powder_pin" },
+        { "powder_offset_z ",                        "diw_powder_offset_z" },
+        { "POWDER NOZZLE OFFSETS ",                  "diw_powder_offset_x" },
+    };
+    return table;
+}
+
+std::string diw_validation_opt_key(const std::string &message)
+{
+    for (const auto &[prefix, key] : diw_validation_opt_key_table())
+        if (message.compare(0, prefix.size(), prefix) == 0)
+            return key;
+    return std::string();
+}
+
+DIWValidation diw_validate(const DynamicPrintConfig &full)
+{
+    DIWValidation v;
+    if (! diw_translation_enabled(full) || ! get_bool(full, "diw_powder_infill", false))
+        return v;
+    try {
+        const Params p = diw_read_translator_params(full);
+        for (const std::string &w : p.config_warnings)
+            v.warnings.emplace_back(w, diw_validation_opt_key(w));
+    } catch (const DIWConfigError &ex) {
+        v.error   = ex.what();
+        v.opt_key = diw_validation_opt_key(v.error);
+    }
+    return v;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Extruded bounding box (v2 _compute_geometric_center), shared with the powder binder
+// ------------------------------------------------------------------------------------------------
+
+namespace DIW {
+
+void extrusion_bbox(const std::string &line, ExtrusionBBox &b)
+{
+    if (b.stopped)
+        return;
+    if (line.find("; CONFIG_BLOCK_START") != std::string::npos) {
+        b.stopped = true;
+        return;
+    }
+    const std::string s = strip(line);
+    if (! b.found_first_layer && (is_layer_marker(s) || s.find(";LAYER:0") != std::string::npos))
+        b.found_first_layer = true;
+    if (starts_with_command(s, "M83"))
+        b.rel = true;
+    else if (starts_with_command(s, "M82"))
+        b.rel = false;
+    if (starts_with_command(s, "G92"))
+        if (WordMatch em = find_word(s, "E"))
+            b.prev_e = em.value;
+    if (is_motion(s)) {
+        const WordMatch xm = find_word(s, "X"), ym = find_word(s, "Y"), em = find_word(s, "E");
+        const double lx = xm ? xm.value : b.tx, ly = ym ? ym.value : b.ty;
+        if (em) {
+            double de;
+            if (b.rel)
+                de = em.value;
+            else {
+                de       = em.value - b.prev_e;
+                b.prev_e = em.value;
+            }
+            if (b.found_first_layer && de > 1e-7) {
+                b.min_x = std::min({ b.min_x, b.tx, lx });
+                b.max_x = std::max({ b.max_x, b.tx, lx });
+                b.min_y = std::min({ b.min_y, b.ty, ly });
+                b.max_y = std::max({ b.max_y, b.ty, ly });
+            }
+        }
+        b.tx = lx;
+        b.ty = ly;
+    }
+}
+
+void extrusion_bbox(const std::vector<std::string> &lines, ExtrusionBBox &b)
+{
+    for (const std::string &line : lines) {
+        if (b.stopped)
+            break;
+        extrusion_bbox(line, b);
+    }
+}
+
+} // namespace DIW
+
 namespace {
 
 // ------------------------------------------------------------------------------------------------
@@ -301,7 +415,7 @@ namespace {
 class Translator : public DIW::UMexSequencer
 {
 public:
-    Translator(const Params &p, bool stub_powder_stage) : DIW::UMexSequencer(p, stub_powder_stage) {}
+    Translator(const Params &p, bool stub_powder_stage, bool v2_parity) : DIW::UMexSequencer(p, stub_powder_stage, v2_parity) {}
 
     // blocks: the accepted ";DIW:" blocks (powder mode only).
     std::string run(const std::vector<std::string> &raw_lines, const std::vector<DIW::PlacedBlock> &blocks);
@@ -326,49 +440,13 @@ private:
 
 void Translator::compute_geometric_center(const std::vector<std::string> &raw_lines)
 {
-    const double inf = std::numeric_limits<double>::infinity();
-    double min_x = inf, max_x = -inf, min_y = inf, max_y = -inf;
-    bool   found_first_layer = false, rel = false;
-    double prev_e = 0., tx = 0., ty = 0.;
-    for (const std::string &line : raw_lines) {
-        if (line.find("; CONFIG_BLOCK_START") != std::string::npos)
-            break;
-        const std::string s = strip(line);
-        if (! found_first_layer && (is_layer_marker(s) || s.find(";LAYER:0") != std::string::npos))
-            found_first_layer = true;
-        if (starts_with_command(s, "M83"))
-            rel = true;
-        else if (starts_with_command(s, "M82"))
-            rel = false;
-        if (starts_with_command(s, "G92"))
-            if (WordMatch em = find_word(s, "E"))
-                prev_e = em.value;
-        if (is_motion(s)) {
-            const WordMatch xm = find_word(s, "X"), ym = find_word(s, "Y"), em = find_word(s, "E");
-            const double lx = xm ? xm.value : tx, ly = ym ? ym.value : ty;
-            if (em) {
-                double de;
-                if (rel)
-                    de = em.value;
-                else {
-                    de     = em.value - prev_e;
-                    prev_e = em.value;
-                }
-                if (found_first_layer && de > 1e-7) {
-                    min_x = std::min({ min_x, tx, lx });
-                    max_x = std::max({ max_x, tx, lx });
-                    min_y = std::min({ min_y, ty, ly });
-                    max_y = std::max({ max_y, ty, ly });
-                }
-            }
-            tx = lx;
-            ty = ly;
-        }
-    }
+    // The shared routine (DIW::extrusion_bbox, also the powder binder's V2 check) over the whole file.
+    DIW::ExtrusionBBox bb;
+    DIW::extrusion_bbox(raw_lines, bb);
     double cx = 0., cy = 0.;
-    if (min_x != inf && min_y != inf) {
-        cx = (min_x + max_x) / 2.0;
-        cy = (min_y + max_y) / 2.0;
+    if (! bb.empty()) {
+        cx = (bb.min_x + bb.max_x) / 2.0;
+        cy = (bb.min_y + bb.max_y) / 2.0;
     }
     nozzle_target_x = cx;
     nozzle_target_y = cy + P.uv_offset_y;
@@ -866,13 +944,13 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
             blocks.push_back({ std::move(r), it->second });
         }
         // Without any block no core layer is converted, so a powder job would come out as paste only.
-        // Refuse it rather than print the wrong part (the slicer does not write records yet, POWDER_PLAN
-        // increment 4); tests set allow_unconverted_powder to run it anyway.
+        // Refuse it rather than print the wrong part (the plan is written by the slicer's export, PRODUCT_DESIGN.md
+        // 5.3); tests set allow_unconverted_powder to run it anyway.
         if (blocks.empty() && ! opts.allow_unconverted_powder)
-            throw DIWConfigError("u-MEX powder infill: core-layer conversion is not available in this build yet; "
-                                 "turn \"u-MEX powder infill\" off");
+            throw DIWConfigError("u-MEX powder infill: this G-code has no powder plan (;DIW: records). Export it again "
+                                 "from OrcaSlicer with u-MEX powder infill on; the plan is written during the export.");
     }
-    Translator t(p, opts.stub_powder_stage);
+    Translator t(p, opts.stub_powder_stage, opts.v2_parity);
     return t.run(lines, blocks);
 }
 

@@ -1,9 +1,14 @@
 #include "DIWUMexSequencer.hpp"
 #include "DIWPyCompat.hpp"
+#include "DIWTranslator.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <iterator>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 // Port of the u-MEX layer machinery of diw_engine.py 2.0.0 (see the header). Function by function, the
@@ -197,6 +202,46 @@ LineInfo GCodeScanner::step(const std::string &raw)
     return li;
 }
 
+ScanState scan_state_after(const LineInfo &li)
+{
+    ScanState s;
+    s.x = li.x1; s.y = li.y1; s.z = li.z1;
+    s.e      = li.e_after;
+    s.rel    = li.rel_after;
+    s.absxyz = ! li.relxyz;
+    s.feed   = li.feed;
+    s.ftype  = li.ftype;
+    s.width  = li.width;
+    return s;
+}
+
+namespace {
+bool same_bits(double a, double b)
+{
+    uint64_t ua, ub;
+    std::memcpy(&ua, &a, sizeof ua);
+    std::memcpy(&ub, &b, sizeof ub);
+    return ua == ub;
+}
+} // namespace
+
+bool same_scan_state(const ScanState &a, const ScanState &b, std::string *what)
+{
+    const char *diff = nullptr;
+    if (! same_bits(a.x, b.x)) diff = "x";
+    else if (! same_bits(a.y, b.y)) diff = "y";
+    else if (! same_bits(a.z, b.z)) diff = "z";
+    else if (! same_bits(a.e, b.e)) diff = "e";
+    else if (a.rel != b.rel) diff = "rel";
+    else if (a.absxyz != b.absxyz) diff = "absxyz";
+    else if (! same_bits(a.feed, b.feed)) diff = "feed";
+    else if (a.ftype != b.ftype) diff = "ftype";
+    else if (a.width.has_value() != b.width.has_value() || (a.width && ! same_bits(*a.width, *b.width))) diff = "width";
+    if (diff && what)
+        *what = diff;
+    return diff == nullptr;
+}
+
 std::vector<LineInfo> scan_gcode(const std::vector<std::string> &lines)
 {
     std::vector<LineInfo> infos;
@@ -337,6 +382,7 @@ LayerModel parse_core_layer(const std::vector<std::string> &lines, const std::ve
                 cur->seg_de.push_back(li.de);
                 cur->seg_feed.push_back(li.feed);
                 cur->seg_raw.push_back(lines[i]);
+                cur->seg_lines.push_back(i);
                 cur->seg_width.push_back(truthy(li.width) ? *li.width : width_fallback);
                 if (! m.z)
                     m.z = li.z1;
@@ -360,6 +406,504 @@ LayerModel parse_core_layer(const std::vector<std::string> &lines, const std::ve
     }
     m.tail = std::move(pending);
     return m;
+}
+
+// ------------------------------------------------------------------------------------------------
+// Sparse infill suppression (PRODUCT_DESIGN.md 4.3 / 4.4)
+// ------------------------------------------------------------------------------------------------
+
+bool operator==(const TraceItem &l, const TraceItem &r)
+{
+    return l.kind == r.kind && l.text == r.text && same_bits(l.a, r.a) && same_bits(l.b, r.b) && same_bits(l.c, r.c) && l.has == r.has;
+}
+
+std::string describe(const TraceItem &t)
+{
+    std::string s = t.text;
+    while (! s.empty() && (s.back() == '\n' || s.back() == '\r'))
+        s.pop_back();
+    const auto opt = [&t](double v) { return t.has ? py_repr(v) : std::string("None"); };
+    switch (t.kind) {
+    case TraceItem::Kind::line: return "line '" + s + "'";
+    case TraceItem::Kind::s1: return "<S1 marker>";
+    case TraceItem::Kind::path_start: return "path start (" + py_repr(t.a) + ", " + py_repr(t.b) + ") travel_feed " + opt(t.c);
+    case TraceItem::Kind::seg: return "segment '" + s + "' de " + py_repr(t.a) + " feed " + py_repr(t.b);
+    case TraceItem::Kind::z: return "model.z " + opt(t.a);
+    case TraceItem::Kind::z_feed: return "model.z_feed " + opt(t.a);
+    }
+    return "?";
+}
+
+std::vector<TraceItem> core_emission_trace(const LayerModel &m, const std::vector<std::string> &lines)
+{
+    std::vector<TraceItem> t;
+    const auto line_item = [&](size_t i) {
+        TraceItem it;
+        it.kind = TraceItem::Kind::line;
+        it.text = lines[i];
+        t.push_back(std::move(it));
+    };
+    const auto s1_item = [&]() {
+        TraceItem it;
+        it.kind = TraceItem::Kind::s1;
+        t.push_back(std::move(it));
+    };
+    for (size_t n = 0; n < m.header.size(); ++n) {
+        line_item(m.header[n]);
+        if (n == 0)
+            s1_item();
+    }
+    if (m.header.empty())
+        s1_item();
+    for (const PathRec &p : m.paths) {
+        if (p.kind != "wall" && p.kind != "paste")
+            continue;
+        for (size_t i : p.pre_lines)
+            line_item(i);
+        TraceItem ps;
+        ps.kind = TraceItem::Kind::path_start;
+        ps.a    = p.points.front().first;
+        ps.b    = p.points.front().second;
+        ps.has  = p.travel_feed.has_value();
+        ps.c    = ps.has ? *p.travel_feed : 0.;
+        t.push_back(std::move(ps));
+        for (size_t j = 0; j < p.seg_de.size(); ++j) {
+            TraceItem sg;
+            sg.kind = TraceItem::Kind::seg;
+            sg.text = j < p.seg_raw.size() ? p.seg_raw[j] : std::string();
+            sg.a    = p.seg_de[j];
+            sg.b    = p.seg_feed[j];
+            t.push_back(std::move(sg));
+        }
+    }
+    for (size_t i : m.tail)
+        line_item(i);
+    TraceItem z;
+    z.kind = TraceItem::Kind::z;
+    z.has  = m.z.has_value();
+    z.a    = z.has ? *m.z : 0.;
+    t.push_back(std::move(z));
+    TraceItem zf;
+    zf.kind = TraceItem::Kind::z_feed;
+    zf.has  = m.z_feed.has_value();
+    zf.a    = zf.has ? *m.z_feed : 0.;
+    t.push_back(std::move(zf));
+    return t;
+}
+
+SuppressMutate suppress_mutate_from_string(const std::string &s)
+{
+    if (s.empty() || s == "none") return SuppressMutate::none;
+    if (s == "drop_restore") return SuppressMutate::drop_restore;
+    if (s == "extra_delete") return SuppressMutate::extra_delete;
+    if (s == "wrong_g92") return SuppressMutate::wrong_g92;
+    throw std::invalid_argument("unknown suppression mutation '" + s + "' (drop_restore, extra_delete, wrong_g92)");
+}
+
+const char *to_string(SuppressMutate m)
+{
+    switch (m) {
+    case SuppressMutate::none: return "none";
+    case SuppressMutate::drop_restore: return "drop_restore";
+    case SuppressMutate::extra_delete: return "extra_delete";
+    case SuppressMutate::wrong_g92: return "wrong_g92";
+    }
+    return "?";
+}
+
+namespace {
+
+// Object-label lines (4.3: a powder path's pre_lines holding one makes the chunk fall back).
+bool is_object_label(const std::string &raw)
+{
+    const std::string s = to_lower(raw);
+    if (s.find("start printing object") != std::string::npos || s.find("stop printing object") != std::string::npos ||
+        s.find("exclude_object_start") != std::string::npos || s.find("exclude_object_end") != std::string::npos)
+        return true;
+    const size_t ci = raw.find(';');
+    return cmd_of(strip(ci != std::string::npos ? raw.substr(0, ci) : raw)) == "M486";
+}
+
+// The text that set each modal value of the ORIGINAL chunk (copied verbatim into the restore lines). Empty: the
+// value was set before the chunk (or by G28); the restore then formats it (shortest fixed form that parses back).
+struct SetTokens
+{
+    std::string x, y, z, e, f, width, type;
+};
+
+void update_tokens(SetTokens &t, const std::string &raw, const LineInfo &li)
+{
+    std::string s = raw;
+    while (! s.empty() && (s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    const size_t ci = s.find(';');
+    const std::string code    = strip(ci != std::string::npos ? s.substr(0, ci) : s);
+    const std::string comment = ci != std::string::npos ? s.substr(ci + 1) : std::string();
+    if (! comment.empty()) {   // the scanner's order: TYPE, else WIDTH
+        if (const size_t i = match_key(comment, "TYPE"); i != std::string::npos)
+            t.type = comment.substr(i);
+        else if (const size_t w = match_key(comment, "WIDTH"); w != std::string::npos) {
+            const size_t e = match_number(comment, w);
+            if (e != std::string::npos)
+                t.width = comment.substr(w, e - w);
+        }
+    }
+    const auto word = [&code](const char *L, std::string &dst) {
+        if (const WordMatch m = find_word(code, L))
+            dst = code.substr(m.begin + 1, m.end - m.begin - 1);
+    };
+    if (li.is_motion) {
+        if (li.relxyz) {   // relative XYZ: the value is not the word (the chunk falls back anyway)
+            if (find_word(code, "X")) t.x.clear();
+            if (find_word(code, "Y")) t.y.clear();
+            if (find_word(code, "Z")) t.z.clear();
+        } else {
+            word("X", t.x);
+            word("Y", t.y);
+            word("Z", t.z);
+        }
+        if (! li.rel_after)
+            word("E", t.e);
+        word("F", t.f);
+    } else if (li.cmd == "G92") {
+        word("E", t.e);
+        word("X", t.x);
+        word("Y", t.y);
+        word("Z", t.z);
+    } else if (li.cmd == "G28")
+        t.x = t.y = t.z = "0";
+}
+
+// tok if it parses back to v bit for bit, else the shortest py_fixed form that does; "" if none.
+std::string number_token(const std::string &tok, double v)
+{
+    if (! tok.empty()) {
+        const size_t e = match_number(tok, 0);
+        if (e == tok.size() && same_bits(parse_number(tok, 0, e), v))
+            return tok;
+    }
+    for (int prec = 0; prec <= 20; ++prec) {
+        const std::string s = py_fixed(prec, v);
+        const size_t e = match_number(s, 0);
+        if (e == s.size() && same_bits(parse_number(s, 0, e), v))
+            return s;
+    }
+    return {};
+}
+
+} // namespace
+
+SuppressResult suppress_sparse(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos, const LayerModel &model,
+                               SuppressMutate mutate)
+{
+    SuppressResult r;
+    const auto fail = [&r](const std::string &why) {
+        SuppressResult f;
+        f.fallback = why;
+        r = std::move(f);
+        return r;
+    };
+    const size_t n = lines.size();
+    if (n == 0 || infos.size() != n)
+        return fail("marker");
+    // ---- removal set R (1 = R, 2 = the extra_delete mutation) ----
+    std::vector<char> in_r(n, 0), path_start(n, 0);
+    for (const PathRec &p : model.paths) {
+        if (! p.seg_lines.empty())
+            path_start[p.seg_lines.front()] = 1;
+        if (p.kind != "powder")
+            continue;
+        for (size_t i : p.pre_lines) {
+            if (is_object_label(lines[i]))
+                return fail("label_in_sparse");
+            in_r[i] = 1;
+        }
+        for (size_t i : p.seg_lines)
+            in_r[i] = 1;
+    }
+    if (in_r[0])
+        return fail("marker");
+    for (const LineInfo &li : infos)
+        if (li.relxyz)
+            return fail("relxyz");
+    if (mutate == SuppressMutate::extra_delete)
+        for (size_t i = n - 1; i > 0; --i)
+            if (! in_r[i] && infos[i].is_extruding_move()) {
+                in_r[i] = 2;
+                break;
+            }
+
+    GCodeScanner prod(scan_state_after(infos[0]));   // line 0 is kept, so both texts have the same state after it
+    SetTokens    tok;
+    update_tokens(tok, lines[0], infos[0]);
+    bool        have_trav_f = false;
+    double      trav_f_val  = 0.;
+    std::string trav_f_tok;
+    bool        prod_seen = false;   // a kept extruding move was written
+    bool        g92_mutated = false;
+    std::string err;
+    r.lines.reserve(n + 8);
+    r.lines.push_back(lines[0]);
+
+    const auto emit = [&](const std::string &line) {
+        r.lines.push_back(line);
+        if (prod.step(line).is_extruding_move())
+            prod_seen = true;
+    };
+    // Restore group: o = the original's LineInfo of the last original line before this point.
+    const auto restore = [&](const LineInfo &o, bool final) -> bool {
+        const ScanState O = scan_state_after(o), Pst = prod.state();
+        if (O.rel != Pst.rel || O.absxyz != Pst.absxyz) {
+            err = "state";
+            return false;
+        }
+        std::vector<std::string> add;
+        double feed_now = Pst.feed;
+        const std::string tf = number_token(tok.f, O.feed);
+        if (tf.empty()) {
+            err = "token";
+            return false;
+        }
+        // R1 position
+        if (! same_bits(O.x, Pst.x) || ! same_bits(O.y, Pst.y) || ! same_bits(O.z, Pst.z)) {
+            if (same_bits(O.x, Pst.x) && same_bits(O.y, Pst.y)) {
+                err = "z_only";
+                return false;
+            }
+            if (! have_trav_f) {
+                err = "no_trav_f";
+                return false;
+            }
+            const std::string tx = number_token(tok.x, O.x), ty = number_token(tok.y, O.y),
+                              tz = same_bits(O.z, Pst.z) ? std::string("-") : number_token(tok.z, O.z),
+                              tt = number_token(trav_f_tok, trav_f_val);
+            if (tx.empty() || ty.empty() || tz.empty() || tt.empty()) {
+                err = "token";
+                return false;
+            }
+            add.push_back("G1 X" + tx + " Y" + ty + (tz == "-" ? std::string() : " Z" + tz) + " F" + tt);
+            feed_now = trav_f_val;
+        }
+        // R2 feed
+        if (! same_bits(feed_now, O.feed))
+            add.push_back("G1 F" + tf);
+        // R3 absolute E (only after the first kept extruding move: before it, a non-motion line joins the header)
+        if (! O.rel && ! same_bits(O.e, Pst.e)) {
+            if (! prod_seen) {
+                err = "leading_abs_e";
+                return false;
+            }
+            std::string te = number_token(tok.e, O.e);
+            // test hook: the end-of-chunk R3 gets a wrong value (an earlier wrong R3 would be corrected by the next
+            // group, which restores against the edited text's own state, so it could never reach the output)
+            if (mutate == SuppressMutate::wrong_g92 && final && ! g92_mutated) {
+                te          = number_token(std::string(), O.e + 1.0);
+                g92_mutated = true;
+            }
+            if (te.empty()) {
+                err = "token";
+                return false;
+            }
+            add.push_back("G92 E" + te);
+        }
+        // R5 width (own line: the scanner reads one tag per line, TYPE before WIDTH)
+        if (O.width.has_value() != Pst.width.has_value() || (O.width && ! same_bits(*O.width, *Pst.width))) {
+            if (! O.width) {
+                err = "state";
+                return false;
+            }
+            const std::string tw = number_token(tok.width, *O.width);
+            if (tw.empty()) {
+                err = "token";
+                return false;
+            }
+            add.push_back("G1 F" + tf + " ;WIDTH:" + tw);
+        }
+        // R4 type: end of chunk only
+        if (final && O.ftype != Pst.ftype) {
+            std::string tt = tok.type;
+            while (! tt.empty() && (tt.back() == '\r' || tt.back() == '\n'))
+                tt.pop_back();
+            const std::optional<std::string> back = match_type("TYPE:" + tt);
+            if (! back || *back != O.ftype) {
+                err = "token";
+                return false;
+            }
+            add.push_back("G1 F" + tf + " ;TYPE:" + tt);
+        }
+        if (add.empty() || mutate == SuppressMutate::drop_restore)
+            return true;
+        const std::string &prev = r.lines.back();
+        if (prev.empty() || prev.back() != '\n') {
+            err = "no_newline";
+            return false;
+        }
+        for (const std::string &a : add) {
+            emit(a + "\n");
+            ++r.restore_lines;
+        }
+        return true;
+    };
+
+    bool in_gap = false, gap_motion = false, deferred = false;
+    const auto track = [&](size_t i) {
+        const LineInfo &li = infos[i];
+        update_tokens(tok, lines[i], li);
+        if (li.is_motion && ! li.is_extruding_move() && li.has_xy()) {   // parse_core_layer's trav_f
+            have_trav_f = true;
+            trav_f_val  = li.feed;
+            trav_f_tok  = tok.f;
+        }
+    };
+    for (size_t i = 1; i < n; ++i) {
+        const LineInfo &li = infos[i];
+        if (in_r[i]) {
+            in_gap = true;
+            if (li.is_motion)
+                gap_motion = true;
+            if (li.is_extruding_move()) {
+                ++r.removed_moves;
+                r.removed_de += li.de;
+            } else
+                ++r.removed_other;
+            track(i);
+            continue;
+        }
+        if (in_gap) {
+            if (gap_motion) {
+                if (! restore(infos[i - 1], false))
+                    return fail(err);
+                deferred = false;
+            } else
+                deferred = true;   // comment / command lines only: restore where a motion line cannot join two paths
+            in_gap = gap_motion = false;
+        }
+        if (deferred && li.is_motion && (! li.is_extruding_move() || path_start[i])) {
+            if (! restore(infos[i - 1], false))
+                return fail(err);
+            deferred = false;
+        }
+        emit(lines[i]);
+        track(i);
+    }
+    if (! restore(infos[n - 1], true))
+        return fail(err);
+    // test hook: no R3 was written (relative E, or E already equal): a wrong G92 E at the end of the chunk
+    if (mutate == SuppressMutate::wrong_g92 && ! g92_mutated && ! r.lines.back().empty() && r.lines.back().back() == '\n')
+        emit("G92 E" + number_token(std::string(), prod.state().e + 1.0) + "\n");
+    return r;
+}
+
+std::string verify_suppression(const std::vector<std::string> &orig, const std::vector<LineInfo> &orig_infos,
+                               const LayerModel &orig_model, const std::vector<std::string> &edited, const ScanState &before,
+                               const ExtrusionBBox &bbox_before, double width_fallback,
+                               const std::function<bool(double, double)> &in_s, std::string *detail)
+{
+    const auto fail = [detail](const char *reason, const std::string &d) {
+        if (detail)
+            *detail = d;
+        return std::string(reason);
+    };
+    if (orig.empty() || edited.empty() || orig_infos.size() != orig.size() || edited[0] != orig[0])
+        return fail("v0_marker", "line 0 differs or a chunk is empty");
+    GCodeScanner sc(before);
+    std::vector<LineInfo> ei;
+    ei.reserve(edited.size());
+    for (const std::string &l : edited)
+        ei.push_back(sc.step(l));
+    // V0: one chunk, opened at line 0, with extrusion and no powder-kind move left
+    const auto one_chunk = [](const std::vector<std::string> &ls, const std::vector<LineInfo> &is) -> std::optional<LayerChunk> {
+        ChunkTracker t;
+        for (size_t i = 0; i < ls.size(); ++i)
+            if (t.step(i, ls[i], is[i]) == ChunkTracker::opened && i != 0)
+                return std::nullopt;
+        if (t.current() == nullptr)
+            return std::nullopt;
+        return t.finish(ls.size());
+    };
+    const std::optional<LayerChunk> oc = one_chunk(orig, orig_infos), ec = one_chunk(edited, ei);
+    if (! oc || ! ec)
+        return fail("v0_chunks", oc ? "the edited text is not one chunk opened at line 0" : "the original is not one chunk opened at line 0");
+    if (ec->n_extruding <= 0)
+        return fail("v0_no_extrusion", "no extruding move left");
+    LayerChunk lc = *ec;
+    lc.start      = 0;
+    lc.end        = edited.size();
+    const LayerModel em = parse_core_layer(edited, ei, lc, width_fallback);
+    for (const PathRec &p : em.paths)
+        if (p.kind == "powder")
+            return fail("v0_powder_left", "powder-kind move left: '" + (p.seg_raw.empty() ? std::string() : rstrip(p.seg_raw.front())) + "'");
+    // V1: emission trace
+    const std::vector<TraceItem> to = core_emission_trace(orig_model, orig), te = core_emission_trace(em, edited);
+    for (size_t j = 0; j < std::max(to.size(), te.size()); ++j)
+        if (j >= to.size() || j >= te.size() || to[j] != te[j])
+            return fail("v1_trace", "trace item " + std::to_string(j) + ": original " + (j < to.size() ? describe(to[j]) : "<end>") +
+                                        ", edited " + (j < te.size() ? describe(te[j]) : "<end>"));
+    // V2: end state, chunk fields, extruded bbox (the translator's rule)
+    std::string what;
+    if (! same_scan_state(scan_state_after(orig_infos.back()), sc.state(), &what))
+        return fail("v2_state", "end-of-chunk scanner state differs in " + what);
+    const auto same_opt = [](const std::optional<double> &a, const std::optional<double> &b) {
+        return a.has_value() == b.has_value() && (! a || same_bits(*a, *b));
+    };
+    if (! same_opt(oc->z, ec->z))
+        return fail("v2_chunk", "chunk.z differs");
+    if (! same_opt(oc->height, ec->height))
+        return fail("v2_chunk", "chunk.height differs");
+    if (oc->has_arc != ec->has_arc || oc->has_relxyz != ec->has_relxyz)
+        return fail("v2_chunk", "chunk.has_arc / has_relxyz differs");
+    const auto chunk_box = [&bbox_before](const std::vector<std::string> &ls) {
+        ExtrusionBBox b = bbox_before;
+        b.min_x = b.min_y = std::numeric_limits<double>::infinity();
+        b.max_x = b.max_y = -std::numeric_limits<double>::infinity();
+        extrusion_bbox(ls, b);
+        return b;
+    };
+    const ExtrusionBBox bo = chunk_box(orig), be = chunk_box(edited);
+    if (! same_bits(bo.min_x, be.min_x) || ! same_bits(bo.max_x, be.max_x) || ! same_bits(bo.min_y, be.min_y) ||
+        ! same_bits(bo.max_y, be.max_y))
+        return fail("v2_bbox", "extruded bbox differs: original [" + py_repr(bo.min_x) + ", " + py_repr(bo.max_x) + "] x [" +
+                                   py_repr(bo.min_y) + ", " + py_repr(bo.max_y) + "], edited [" + py_repr(be.min_x) + ", " +
+                                   py_repr(be.max_x) + "] x [" + py_repr(be.min_y) + ", " + py_repr(be.max_y) + "]");
+    if (bo.found_first_layer != be.found_first_layer || bo.rel != be.rel || bo.stopped != be.stopped || ! same_bits(bo.prev_e, be.prev_e) ||
+        ! same_bits(bo.tx, be.tx) || ! same_bits(bo.ty, be.ty))
+        return fail("v2_bbox", "end state of the bbox scan differs");
+    // V3: every removed powder vertex lies in S
+    if (in_s)
+        for (const PathRec &p : orig_model.paths)
+            if (p.kind == "powder")
+                for (const auto &[x, y] : p.points)
+                    if (! in_s(x, y))
+                        return fail("v3_outside", "powder vertex X" + py_repr(x) + " Y" + py_repr(y) + " outside S");
+    return {};
+}
+
+SuppressOutcome suppress_and_verify(const std::vector<std::string> &lines, const std::vector<LineInfo> &infos, const LayerModel &model,
+                                    const ScanState &before, const ExtrusionBBox &bbox_before, double width_fallback,
+                                    SuppressMutate mutate, bool skip_verify, const std::function<bool(double, double)> &in_s)
+{
+    SuppressOutcome o;
+    try {
+        o.result = suppress_sparse(lines, infos, model, mutate);
+        if (o.result.fallback.empty() && ! skip_verify) {
+            std::string reason = verify_suppression(lines, infos, model, o.result.lines, before, bbox_before, width_fallback, in_s, &o.detail);
+            if (! reason.empty())
+                o.result.fallback = std::move(reason);
+        }
+    } catch (const std::exception &ex) {
+        o.result          = SuppressResult();
+        o.result.fallback = "exception";
+        o.detail          = ex.what();
+    }
+    if (o.result.fallback.empty())
+        o.applied = true;
+    else {
+        std::string reason = std::move(o.result.fallback);
+        o.result          = SuppressResult();
+        o.result.fallback = std::move(reason);
+        o.result.lines    = lines;
+    }
+    return o;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -619,6 +1163,12 @@ std::optional<UMexSequencer::Lines> UMexSequencer::convert_core_layer(const std:
                              py_repr(pf.f_calc) + " for layer height " + py_repr(h) + "; the block is rejected");
     const double F = pf.F;
     if (rec.status == PowderLayerRec::Status::open) {
+        // A non-carrier st=open block (the h <= 0 and policy=error carriers left above). Production refuses it
+        // (PRODUCT_DESIGN.md 5.3): the native planner never writes one for a native core layer, so it is v2-made or a
+        // planner failure, and paste would print the part without powder there. v2_parity keeps v2's behaviour.
+        if (! m_v2_parity)
+            throw DIWConfigError("u-MEX powder records: layer " + std::to_string(k) + " has no closed wall loop (st=open); this "
+                                 "powder plan cannot be printed. Export the G-code again from OrcaSlicer.");
         warn("layer " + std::to_string(k) + ": wall loops could not be closed into a cavity; layer left as paste.");
         return std::nullopt;
     }

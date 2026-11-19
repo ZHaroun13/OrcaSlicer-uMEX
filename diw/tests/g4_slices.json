@@ -1,0 +1,8 @@
+{
+  "doc": "Increment-5 G4 plates (diw/PRODUCT_DESIGN.md section 8, G4) that have no custom G-code, run through the increment-4 T2 checks against v2 (shadow mode): shadow_export.py --matrix --extra g4_slices.json --only g4_ --powder-mode shadow. tall_short is cube25 + cube10 (planner_meshes.py) on one plate; with precise_z_height = 0 both cubes share every print layer, so the short cube's top surface and the tall cube's sparse infill meet on one layer (no block there, v2 parity); the _precise variant keeps the test profile's precise_z_height = 1 (the short cube gets its own z values near its top). final_core is cube25 with top_shell_layers = 0 (the last layer has sparse infill and no block). The product-mode side, warnings and the custom-G-code classes (text_only, native_only (a)) are product_gate.py g4. No mesh_delta: the default meshes are used; no role: no coverage counters.",
+  "slices": [
+    {"part": "tall_short", "variant": "classic.g4_tall_short", "overrides": {"precise_z_height": "0"}},
+    {"part": "tall_short", "variant": "classic.g4_tall_short_precise", "overrides": {}},
+    {"part": "cube25", "variant": "classic.g4_final_core", "overrides": {"top_shell_layers": "0"}}
+  ]
+}

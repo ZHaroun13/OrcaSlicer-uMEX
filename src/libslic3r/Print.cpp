@@ -20,6 +20,7 @@
 #include "Geometry.hpp"
 #include <map>
 #include <cmath>
+#include <cstdio>
 #include <Eigen/Geometry>
 #include <set>
 #include "Slicing.hpp"
@@ -105,6 +106,8 @@
 #include "nlohmann/json.hpp"
 
 #include "GCode/ConflictChecker.hpp"
+#include "GCode/DIWPowderShadow.hpp"
+#include "GCode/DIWTranslator.hpp"
 
 #include <codecvt>
 #include "Format/STEP.hpp"
@@ -123,6 +126,24 @@ namespace Slic3r {
 
 // PrintApply.cpp: TEST ONLY, ORCA_DIW_TEST_KEEP_SEAM_GAP=1 keeps a non-zero seam gap on DIW printers.
 bool diw_test_keep_seam_gap();
+// PrintApply.cpp: TEST ONLY, ORCA_DIW_TEST_KEEP_SCARF=1 keeps the scarf joint seam of u-MEX powder jobs.
+bool diw_test_keep_scarf();
+
+// TEST ONLY (diw/PRODUCT_DESIGN.md 2): ORCA_DIW_TEST_SKIP_VALIDATE=1 skips the u-MEX powder-job rules of
+// Print::validate (and the DIW retraction warnings), so the export-time safety nets can be tested.
+static bool diw_test_skip_validate()
+{
+    const char *v = std::getenv("ORCA_DIW_TEST_SKIP_VALIDATE");
+    return v != nullptr && v[0] == '1' && v[1] == 0;
+}
+
+// A number in a DIW validation message: shortest form with up to 6 significant digits ("0.9", "45", "2.5").
+static std::string diw_num(double v)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%g", v);
+    return buf;
+}
 
 Print::SlicingPipelineHookFn Print::s_slicing_pipeline_hook_fn = nullptr;
 
@@ -2106,6 +2127,77 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                "Turn off \"Wipe on loops\" and \"Wipe before external loop\" in this object's settings."),
                              object, "wipe_on_loops" };
             }
+    }
+
+    // DIW / u-MEX powder jobs (diw/PRODUCT_DESIGN.md 6.1-6.3) and the DIW retraction warnings. TEST ONLY:
+    // ORCA_DIW_TEST_SKIP_VALIDATE=1 skips them, so that the export-time safety nets can be reached.
+    if (m_config.diw_printer.value && ! diw_test_skip_validate()) {
+        if (m_config.diw_powder_infill.value) {
+            // Structural refusals of the powder planner (the binder's reasons).
+            const bool spiral = m_config.spiral_mode.value, remap = BeltTransformPipeline::axis_remap_enabled(m_config);
+            if (const std::string why = DIW::powder_refusal_reason(m_full_print_config, this->is_BBL_printer(), spiral, remap); ! why.empty()) {
+                const char *key = this->is_BBL_printer() ? "" : spiral ? "spiral_mode" : remap ? "belt_printer" :
+                                  m_config.belt_printer.value ? "belt_printer" : "extruder_offset";
+                return { "u-MEX powder infill cannot be used with " + why + ".", nullptr, key };
+            }
+            // v2's hard limits (exact v2 messages, as the translator gives them) and soft warnings.
+            const DIWValidation v = diw_validate(m_full_print_config);
+            if (! v.error.empty())
+                return { v.error, nullptr, v.opt_key };
+            for (const auto &[msg, key] : v.warnings)
+                warn(msg, key);
+            bool any_sparse = false;
+            for (const PrintObject *object : m_objects)
+                for (const PrintRegion &region : object->all_regions()) {
+                    const PrintRegionConfig &rc = region.config();
+                    if (rc.seam_slope_type.value != SeamScarfType::None && ! diw_test_keep_scarf())
+                        return { L("u-MEX powder jobs cannot use a scarf joint seam: it ramps the outer wall below the layer and "
+                                   "the powder cavity is planned on flat layers. Set \"Scarf joint seam\" to None in this "
+                                   "object's settings."),
+                                 object, "seam_slope_type" };
+                    if (rc.wall_loops.value == 0)
+                        return { L("u-MEX powder infill needs at least one wall loop: the powder cavity is closed by the outer wall."),
+                                 object, "wall_loops" };
+                    if (rc.infill_combination.value)
+                        return { L("u-MEX powder jobs cannot combine infill: sparse infill printed every N layers would get the "
+                                   "powder of one layer only. Turn \"Infill combination\" off."),
+                                 object, "infill_combination" };
+                    // At 100 % the sparse infill becomes solid infill: no core layer would exist (the export would fail late).
+                    if (rc.sparse_infill_density.value >= 100.)
+                        return { L("u-MEX powder infill needs sparse infill: at a sparse infill density of 100% the infill is "
+                                   "solid and there is no cavity for the powder. Set a sparse infill density below 100% in "
+                                   "this object's settings or turn u-MEX powder infill off."),
+                                 object, "sparse_infill_density" };
+                    if (rc.sparse_infill_density.value > 0.)
+                        any_sparse = true;
+                }
+            if (! any_sparse)
+                return { L("u-MEX powder infill needs sparse infill: the powder replaces the sparse infill of the core layers. "
+                           "Set a sparse infill density above 0 or turn u-MEX powder infill off."),
+                         nullptr, "sparse_infill_density" };
+        }
+        // Retractions (paste and powder jobs): the translator blocks or clamps them per line, as v2 does.
+        bool w_long = false, w_off = false, w_speed = false;
+        for (const unsigned int e : extruders) {
+            const double len = m_config.retraction_length.get_at(e), spd = m_config.retraction_speed.get_at(e);
+            const bool   on  = m_config.diw_retraction_enable.get_at(e);
+            const double max_len = m_config.diw_retraction_max_length.get_at(e), max_spd = m_config.diw_retraction_max_speed.get_at(e);
+            if (on && len > max_len && ! w_long) {
+                w_long = true;
+                warn("Retractions of " + diw_num(len) + " mm are longer than the DIW limit of " + diw_num(max_len) +
+                         " mm (\"Maximum syringe retraction\"); the DIW translation may remove retractions longer than the limit, as v2 does.",
+                     "retraction_length");
+            }
+            if (! on && len > 0. && ! w_off) {
+                w_off = true;
+                warn("Syringe retraction is off on this DIW printer; the DIW translation removes retraction moves.", "retraction_length");
+            }
+            if (spd > max_spd && ! w_speed) {
+                w_speed = true;
+                warn("Retraction speed " + diw_num(spd) + " mm/s is clamped to the DIW limit of " + diw_num(max_spd) + " mm/s.",
+                     "retraction_speed");
+            }
+        }
     }
 
     // A flow ratio of 0 would extrude nothing, and a nil one would write NaN extrusion lengths.

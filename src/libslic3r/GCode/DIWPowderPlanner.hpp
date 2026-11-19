@@ -93,7 +93,9 @@ struct PlanDebug
 };
 
 // Fills status, STAT, runs and fallbacks; the caller sets k, z, h, s, F, fu and fp.
-PowderLayerRec plan_powder_layer_native(const PlanInput &in, PlanDebug *dbg = nullptr);
+// s_out (PRODUCT_DESIGN.md 3.4, the binder's orphan check): receives S, the even-odd union of the rings (G-code frame,
+// nm grid), or stays empty when the layer has no ring. It does not enter the record.
+PowderLayerRec plan_powder_layer_native(const PlanInput &in, PlanDebug *dbg = nullptr, ExPolygons *s_out = nullptr);
 
 // ------------------------------------------------------------------------------------------------
 // Building blocks, exposed for the unit tests (tests/libslic3r/test_diw_planner.cpp).

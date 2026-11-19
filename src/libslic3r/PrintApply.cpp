@@ -1369,6 +1369,15 @@ static bool diw_test_keep_fdm()
     return v != nullptr && v[0] == '1' && v[1] == 0;
 }
 
+// TEST ONLY (diw/PRODUCT_DESIGN.md 6.1): ORCA_DIW_TEST_KEEP_SCARF=1 keeps the scarf joint seam of a u-MEX powder job,
+// and Print::validate then accepts a per-object scarf, so the powder planner can be tested on scarf seams (stress
+// variants). Never set it for a real print.
+bool diw_test_keep_scarf()
+{
+    const char *v = std::getenv("ORCA_DIW_TEST_KEEP_SCARF");
+    return v != nullptr && v[0] == '1' && v[1] == 0;
+}
+
 static void apply_diw_overrides(DynamicPrintConfig &cfg)
 {
     if (auto *flavor = cfg.option<ConfigOptionEnum<GCodeFlavor>>("gcode_flavor"); flavor && flavor->value == gcfPlanetCNC) {
@@ -1389,6 +1398,12 @@ static void apply_diw_overrides(DynamicPrintConfig &cfg)
     for (const char *key : { "wipe_on_loops", "wipe_before_external_loop" })
         if (auto *o = cfg.option<ConfigOptionBool>(key))
             o->value = false;
+    // u-MEX powder jobs: the scarf joint seam ramps the outer wall below the layer plane, so the powder cavity
+    // (planned on flat layers) cannot be closed there, and the overlap double-extrudes paste at the seam.
+    // Paste-only DIW jobs keep it.
+    if (const auto *powder = cfg.option<ConfigOptionBool>("diw_powder_infill"); powder != nullptr && powder->value && ! diw_test_keep_scarf())
+        if (auto *o = cfg.option<ConfigOptionEnum<SeamScarfType>>("seam_slope_type"); o && o->value != SeamScarfType::None)
+            o->value = SeamScarfType::None;
     if (diw_test_keep_fdm())
         return;
     // Arcs: the auger command and the powder planner work on straight segments.

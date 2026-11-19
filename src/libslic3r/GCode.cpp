@@ -2960,10 +2960,29 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         file.attach_diw(m_diw_shadow.get());
     else if (! m_diw_refusal.empty())
         BOOST_LOG_TRIVIAL(info) << "DIW shadow planner off: " << m_diw_refusal;
+    // Increment 5 (diw/PRODUCT_DESIGN.md 5.1, H1): in product mode a refused powder job stops the export. The kill
+    // switch is a test switch and keeps the increment-4 behaviour (the translator refuses the file later).
+    bool diw_product_refusal = false;
+    if (! m_diw_shadow && ! m_diw_refusal.empty()) {
+        const DynamicPrintConfig &diw_full   = print->full_print_config();
+        const auto               *diw_powder = diw_full.option<ConfigOptionBool>("diw_powder_infill");
+        bool                      diw_product = true;   // an invalid mode value is refused as product
+        try {
+            diw_product = DIW::ShadowOptions::from_env().product();
+        } catch (const std::exception &) {
+        }
+        const char *diw_kill = std::getenv("ORCA_DIW_NO_NATIVE_PLAN");
+        diw_product_refusal  = diw_product && diw_translation_enabled(diw_full) && diw_powder != nullptr && diw_powder->value &&
+                              ! (diw_kill != nullptr && std::string(diw_kill) == "1");
+    }
 
     try {
+        if (diw_product_refusal)
+            throw DIWConfigError("u-MEX powder infill cannot be used: " + m_diw_refusal);
         this->_do_export(*print, file, thumbnail_cb);
         file.diw_finish();
+        if (m_diw_shadow && m_diw_shadow->failed())
+            throw DIWConfigError(m_diw_shadow->failure_message());
         file.flush();
         if (file.is_error()) {
             file.close();
@@ -3066,7 +3085,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_processor.finalize(true);
     BOOST_LOG_TRIVIAL(info) << "DIW export timing: export_ms="
                             << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - diw_export_t0).count()
-                            << (m_diw_shadow ? " shadow=on" : " shadow=off");
+                            << (m_diw_shadow ? " shadow=on" : " shadow=off")
+                            << (m_diw_shadow ? std::string(" mode=") + DIW::to_string(m_diw_shadow->options().mode) : std::string());
     // DIW powder planner, shadow mode (diw/PLANNER_DESIGN.md 8): aggregated warnings and one summary line.
     if (m_diw_shadow) {
         for (const std::string &w : m_diw_shadow->warnings()) {
@@ -3074,6 +3094,9 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             print->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, w);
         }
         BOOST_LOG_TRIVIAL(info) << m_diw_shadow->summary();
+        // Increment 5 (diw/PRODUCT_DESIGN.md 5.1): suppression fallbacks go to the log only, one line per reason.
+        for (const std::string &l : m_diw_shadow->fallback_log())
+            BOOST_LOG_TRIVIAL(info) << l;
         m_diw_shadow.reset();
     } else if (! m_diw_refusal.empty()) {
         const std::string w = "u-MEX native powder planner disabled: " + m_diw_refusal;

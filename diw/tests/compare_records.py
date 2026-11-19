@@ -477,7 +477,7 @@ def main(argv):
                 with open(p_in, "wb") as fh:
                     fh.write(f_in)
                 s, t = cpp.translate(p_in, p_in.replace(".gcode", ".out.gcode"),
-                                     ["--config-from-gcode", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
+                                     ["--config-from-gcode", "--v2-parity", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
                                      p_in.replace(".gcode", ".log"))
                 want = [f"record at line {errs[0][0]} ", f"({errs[0][1]})"] if errs else ["<no reader error>"]
                 if s == "FAIL" and t.startswith("exit 3:") and all(w in t for w in want):
@@ -491,7 +491,7 @@ def main(argv):
                 with open(p_in, "wb") as fh:
                     fh.write(f_in2)
                 s, t = cpp.translate(p_in, p_in.replace(".gcode", ".out.gcode"),
-                                     ["--config-from-gcode", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
+                                     ["--config-from-gcode", "--v2-parity", "--stub-powder-stage"], ["diw_powder_infill=1"] + ov,
                                      p_in.replace(".gcode", ".log"))
                 if s == "ok":
                     n_s1 = t.count(b" S1 paste contour ")

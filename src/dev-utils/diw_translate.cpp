@@ -8,6 +8,13 @@
 //   --stub-powder-stage         stage 4 of a converted core layer emits only its header comment line
 //                               (DIWTranslateOptions::stub_powder_stage; tests only, increment 3a;
 //                               without it stage 4 emits the powder runs, increment 3b)
+//   --v2-parity                 a non-carrier st=open block is left as paste with v2's warning instead of
+//                               stopping the translation (DIWTranslateOptions::v2_parity; tests that translate
+//                               records made by v2 only, PRODUCT_DESIGN.md 5.3)
+//   diw_translate [--config-from-gcode <in.gcode>] --validate [key=value ...]
+//                               print diw_validate() of the settings (PRODUCT_DESIGN.md 6.2): one line
+//                               "error<TAB><opt_key><TAB><message>" or nothing, then one line
+//                               "warning<TAB><opt_key><TAB><message>" per warning; exit 3 on an error, else 0
 //   diw_translate --pyrepr      read 16-hex-digit IEEE-754 bit patterns from stdin and print
 //                               "<py_repr> <py_g>" for each (checks DIWPyCompat against Python)
 //   diw_translate --pyhypot     per stdin line of hex doubles dx1 dy1 dx2 dy2 ...: hex of py_hypot of each
@@ -27,7 +34,12 @@
 //   diw_translate [--config-from-gcode] --plan-records [--feed-size N] <in.gcode> <out.gcode> [key=value ...]
 //                               offline shadow binder (PLANNER_DESIGN.md section 9): writes in.gcode with the
 //                               native ";DIW:" record blocks inserted (text-only adapter, or native captures
-//                               reloaded from ORCA_DIW_SHADOW_DUMP); summary and warnings on stderr
+//                               reloaded from ORCA_DIW_SHADOW_DUMP); summary and warnings on stderr.
+//                               Shadow mode (increment 4) unless --product, whatever ORCA_DIW_POWDER_MODE says.
+//     --product                 product mode (PRODUCT_DESIGN.md 2): native authority, strictness and sparse
+//                               infill suppression; a failure prints the export-stopping message and exits 3
+//                               (the output is still written)
+//     --no-suppress             with --product: no suppression (ShadowOptions::suppress = false)
 // Records output goes to stdout in binary mode (LF only).
 // Exit codes: 0 ok, 1 I/O or other error, 2 usage, 3 invalid u-MEX settings (DIWConfigError).
 
@@ -326,7 +338,8 @@ static int plan_json_mode(const std::string &in_path, const std::string &out_pat
 // feed_size bytes. Existing ";DIW:" record lines are removed first (as the translator does). Chunks without
 // placeholders use the text-only adapter; with placeholders, the native captures are reloaded from
 // ORCA_DIW_SHADOW_DUMP when it is set. The summary and the warnings go to stderr.
-static int plan_records_mode(const std::string &in_path, const std::string &out_path, const DynamicPrintConfig &cfg, size_t feed_size)
+static int plan_records_mode(const std::string &in_path, const std::string &out_path, const DynamicPrintConfig &cfg, size_t feed_size,
+                             bool product, bool no_suppress)
 {
     std::string raw;
     if (! read_file(in_path, raw))
@@ -346,6 +359,11 @@ static int plan_records_mode(const std::string &in_path, const std::string &out_
         return 2;
     }
     DIW::ShadowOptions o = DIW::ShadowOptions::from_env();
+    // PRODUCT_DESIGN.md 2: shadow mode unless --product, whatever ORCA_DIW_POWDER_MODE says (the increment-4 T2(d)
+    // replay and G9's reference command keep their meaning)
+    o.mode               = product ? DIW::ShadowOptions::Mode::product : DIW::ShadowOptions::Mode::shadow;
+    if (no_suppress)
+        o.suppress = false;
     o.text_only          = true;
     if (const auto *hp = cfg.option<ConfigOptionBool>("high_precision_gcode"); hp != nullptr && hp->value)
         o.xy_decimals = 4;
@@ -362,17 +380,26 @@ static int plan_records_mode(const std::string &in_path, const std::string &out_
     sh.finish(sink);
     boost::nowide::cerr << sh.summary() << "\n";
     for (const std::string &w : sh.warnings()) boost::nowide::cerr << "warning: " << w << "\n";
+    for (const std::string &w : sh.fallback_log()) boost::nowide::cerr << "info: " << w << "\n";
     boost::nowide::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     f.write(out.data(), std::streamsize(out.size()));
-    return f ? 0 : 1;
+    if (! f)
+        return 1;
+    if (sh.failed()) {
+        // product mode: the export would have stopped (PRODUCT_DESIGN.md 5.1); the output is still written
+        boost::nowide::cerr << "error: " << sh.failure_message() << "\n";
+        return 3;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
     boost::nowide::args nowide_args(argc, argv);
     bool config_from_gcode = false;
-    enum class Mode { Translate, DumpRecords, RewriteRecords, Fingerprint, PlanRecords } mode = Mode::Translate;
+    enum class Mode { Translate, DumpRecords, RewriteRecords, Fingerprint, PlanRecords, Validate } mode = Mode::Translate;
     size_t feed_size = 65536;
+    bool   plan_product = false, plan_no_suppress = false;
     DIWTranslateOptions opts;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
@@ -399,6 +426,10 @@ int main(int argc, char **argv)
             opts.allow_unconverted_powder = true;
         else if (a == "--stub-powder-stage")
             opts.stub_powder_stage = true;
+        else if (a == "--v2-parity")
+            opts.v2_parity = true;
+        else if (a == "--validate")
+            mode = Mode::Validate;
         else if (a == "--dump-records")
             mode = Mode::DumpRecords;
         else if (a == "--rewrite-records")
@@ -407,6 +438,10 @@ int main(int argc, char **argv)
             mode = Mode::Fingerprint;
         else if (a == "--plan-records")
             mode = Mode::PlanRecords;
+        else if (a == "--product")
+            plan_product = true;
+        else if (a == "--no-suppress")
+            plan_no_suppress = true;
         else if (a == "--feed-size" && i + 1 < argc)
             feed_size = size_t(std::stoull(argv[++i]));
         else
@@ -444,18 +479,39 @@ int main(int argc, char **argv)
             return write_stdout(DIW::fingerprint_string(U) + "\n" + DIW::hex8(DIW::plan_fingerprint(U)) + "\n");
         }
 
+        if (mode == Mode::Validate) {
+            // the settings only: [in.gcode with --config-from-gcode] then key=value overrides
+            if (config_from_gcode && args.empty()) {
+                boost::nowide::cerr << "usage: diw_translate [--config-from-gcode <in.gcode>] --validate [key=value ...]\n";
+                return 2;
+            }
+            DynamicPrintConfig cfg;
+            const std::string in_path = config_from_gcode ? args[0] : std::string();
+            if (! build_config(cfg, in_path, config_from_gcode,
+                               std::vector<std::string>(args.begin() + (config_from_gcode ? 1 : 0), args.end())))
+                return 2;
+            const DIWValidation v = diw_validate(cfg);
+            std::string out;
+            if (! v.error.empty())
+                out += "error\t" + v.opt_key + "\t" + v.error + "\n";
+            for (const auto &[msg, key] : v.warnings)
+                out += "warning\t" + key + "\t" + msg + "\n";
+            if (write_stdout(out) != 0)
+                return 1;
+            return v.error.empty() ? 0 : 3;
+        }
         if (mode == Mode::PlanRecords) {
             if (args.size() < 2) {
-                boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] --plan-records [--feed-size N] <in.gcode> <out.gcode> [key=value ...]\n";
+                boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] --plan-records [--product [--no-suppress]] [--feed-size N] <in.gcode> <out.gcode> [key=value ...]\n";
                 return 2;
             }
             DynamicPrintConfig cfg;
             if (! build_config(cfg, args[0], config_from_gcode, std::vector<std::string>(args.begin() + 2, args.end())))
                 return 2;
-            return plan_records_mode(args[0], args[1], cfg, feed_size);
+            return plan_records_mode(args[0], args[1], cfg, feed_size, plan_product, plan_no_suppress);
         }
         if (args.size() < 2) {
-            boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] [--allow-unconverted-powder] [--stub-powder-stage] <in.gcode> <out.gcode> [key=value ...]\n";
+            boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] [--allow-unconverted-powder] [--stub-powder-stage] [--v2-parity] <in.gcode> <out.gcode> [key=value ...]\n";
             return 2;
         }
         DynamicPrintConfig cfg;

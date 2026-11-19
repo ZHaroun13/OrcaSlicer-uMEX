@@ -8,8 +8,16 @@ usage:
   python shadow_export.py --matrix --engine <v2 engine dir> --orca <orca-slicer.exe> --translate <diw_translate.exe>
                           --datadir <orca datadir> --work <dir> [-j N] [--only <substring>] [--no-t10] [--no-t4d]
                           [--allow-version-drift] [--slice-only] [--reuse <stage-5a work dir>]
+                          [--extra <coverage_slices.json>]   (increment 5: adds the coverage set, its frozen
+                          counts checked (kind COV) and the coverage counters asserted; --only cov_ runs it alone;
+                          --extra g4_slices.json --only g4_ runs the increment-5 G4 tall_short / final_core plates
+                          through the same checks, without coverage counters)
                           (--only T10 runs T10 alone; --only T4d. runs T4(d) alone)
   python shadow_export.py --matrix --t5 <same arguments> [--only T5.<part>.<walls>]
+  Every form also takes --powder-mode shadow|product (increment 5, PRODUCT_DESIGN.md 8 S0): "shadow" sets
+  ORCA_DIW_POWDER_MODE=shadow on every export (the increment-4 behaviour) and passes --v2-parity to every translation
+  the harness makes, and the matrix forms assert that the shadow exports hold no native non-carrier st=open block
+  (kind S0). Without it the slicer default (product) is used and translations are strict.
 
 Slices with the OrcaSlicer CLI, the DIW printer (profiles/flat_machine_diw.json) and the powder process
 (profiles/flat_process_powder.json), with ORCA_DIW_EXPORT_UNTRANSLATED=1 so the raw file with the records is kept.
@@ -134,7 +142,7 @@ def default_settings():
     return os.path.join(prof, "flat_machine_diw.json") + ";" + os.path.join(prof, "flat_process_powder.json")
 
 
-def slice_part(orca, datadir, stls, out_dir, env_extra, settings=None, extra_args=(), arrange=True):
+def slice_part(orca, datadir, stls, out_dir, env_extra, settings=None, extra_args=(), arrange=True, untranslated=True):
     os.makedirs(out_dir, exist_ok=True)
     for f in os.listdir(out_dir):
         p = os.path.join(out_dir, f)
@@ -143,7 +151,10 @@ def slice_part(orca, datadir, stls, out_dir, env_extra, settings=None, extra_arg
         else:
             os.remove(p)
     env = {k: v for k, v in os.environ.items() if not k.startswith("ORCA_DIW_")}
-    env["ORCA_DIW_EXPORT_UNTRANSLATED"] = "1"
+    if untranslated:   # False: the shipped in-slicer translation runs (OrcaSlicer.cpp diw_translate_gcode_file)
+        env["ORCA_DIW_EXPORT_UNTRANSLATED"] = "1"
+    if powder_mode():
+        env["ORCA_DIW_POWDER_MODE"] = powder_mode()
     env.update(env_extra)
     # the CLI logs only into --logfile (info level: the planner summary line too)
     logfile = os.path.abspath(out_dir) + ".orca.log"
@@ -184,6 +195,56 @@ def opt(argv, name, default=None):
         i = argv.index(name)
         return argv[i + 1]
     return default
+
+
+# increment 5: the harness powder mode travels to the worker processes through this variable (not ORCA_DIW_*, which
+# slice_part / run_tr strip from the inherited environment)
+POWDER_MODE_VAR = "DIW_HARNESS_POWDER_MODE"
+
+
+def powder_mode():
+    return os.environ.get(POWDER_MODE_VAR, "")
+
+
+def set_powder_mode(argv):
+    m = opt(argv, "--powder-mode")
+    if m is not None and m not in ("shadow", "product"):
+        raise SystemExit(f"--powder-mode must be shadow or product, not {m!r}")
+    if m:
+        os.environ[POWDER_MODE_VAR] = m
+    else:
+        os.environ.pop(POWDER_MODE_VAR, None)
+    return m
+
+
+def tr_argv(argv):
+    """--v2-parity on every translation made in shadow mode (PRODUCT_DESIGN.md 2, 8 S0); --plan-records only replays."""
+    argv = list(argv)
+    if powder_mode() == "shadow" and "--config-from-gcode" in argv and "--plan-records" not in argv \
+            and "--v2-parity" not in argv:
+        argv.insert(argv.index("--config-from-gcode") + 1, "--v2-parity")
+    return argv
+
+
+OVERFLOW_RE = re.compile(rb"^; diw_powder_overflow_policy = (\S+)", re.M)
+
+
+def open_noncarrier(data):
+    """Native non-carrier st=open blocks of an export: [k] of every ;DIW:BEGIN with st=open that is neither the
+    h <= 0 carrier nor the policy=error carrier (F == fu) (the translator's rule, DIWUMexSequencer.cpp)."""
+    m = OVERFLOW_RE.search(data)
+    policy_error = m is not None and m.group(1).strip() == b"error"
+    out = []
+    for l in data.split(b"\n"):
+        if not l.startswith(b";DIW:BEGIN"):
+            continue
+        f = begin_fields(l.decode("ascii", "replace").strip())
+        if f.get("st") != "open":
+            continue
+        carrier = float(f["h"]) <= 0.0 or (policy_error and f.get("F") == f.get("fu"))
+        if not carrier:
+            out.append(int(f["k"]))
+    return out
 
 
 def main_stage4(argv):
@@ -263,7 +324,8 @@ def main_stage4(argv):
         # ---- T2(b): the translator accepts the records
         on_path = os.path.join(work, f"{part}.on", "plate_1.gcode")
         out_path = os.path.join(work, f"{part}.on", "translated.gcode")
-        r = subprocess.run([tr, "--config-from-gcode", on_path, out_path], capture_output=True, cwd=os.path.dirname(tr))
+        r = subprocess.run([tr] + tr_argv(["--config-from-gcode", on_path, out_path]), capture_output=True,
+                           cwd=os.path.dirname(tr))
         rep.check(f"{part}.T2b.translate", r.returncode == 0,
                   f"rc={r.returncode} " + r.stderr.decode(errors="replace").strip()[-300:])
         if r.returncode == 0 and os.path.isfile(out_path):
@@ -338,11 +400,14 @@ EXTRA = [
 # A DIW printer forces arc fitting and the cooling slowdown off (PrintApply.cpp apply_diw_overrides); the test-only
 # ORCA_DIW_TEST_KEEP_FDM=1 keeps them, for every export of the slice (kill, on, keep).
 KEEP_FDM = {"ORCA_DIW_TEST_KEEP_FDM": "1"}
+KEEP_SCARF = {"ORCA_DIW_TEST_KEEP_SCARF": "1"}
 PE_FAN_COOL = {"max_volumetric_extrusion_rate_slope": "2", "max_volumetric_extrusion_rate_slope_segment_length": "3",
                "fan_speedup_time": "0.5", "fan_speedup_overhangs": "0", "slow_down_for_layer_cooling": "1",
                "slow_down_layer_time": "60", "slow_down_min_speed": "10"}
 # multi_height: two_a at 0.2 mm and two_b at 0.3 mm layer height (assemble list, per-object layer_height)
 STRESS_PLATES = {"cube_ring": (["cube25", "ring"], [])}
+# increment-5 G4 plates (PRODUCT_DESIGN.md 8 G4; run through --extra g4_slices.json, never part of the matrix)
+G4_PLATES = {"tall_short": (["cube25", "cube10"], [])}
 ASSEMBLE = {"multi_height": [("two_a", {"layer_height": "0.2"}), ("two_b", {"layer_height": "0.3"})]}
 STRESS = [
     ("two_objects", "classic.sequential", {"print_sequence": "by object"}, {}),
@@ -358,9 +423,10 @@ STRESS = [
     ("cube_ring", "classic.arcs", {"enable_arc_fitting": "enabled"}, KEEP_FDM),
     ("cube_ring", "arachne.arcs", {"enable_arc_fitting": "enabled", "wall_generator": "arachne"}, KEEP_FDM),
     ("cube25", "classic.arcs_sparse", {"enable_arc_fitting": "sparse_infill"}, KEEP_FDM),
-    ("cube25", "classic.scarf", {"seam_slope_type": "external"}, {}),
-    ("ring", "classic.scarf", {"seam_slope_type": "external"}, {}),
-    ("lshape", "arachne.scarf_all", {"seam_slope_type": "all", "wall_generator": "arachne"}, {}),
+    # increment 5: a powder job forces the scarf off (PrintApply.cpp); ORCA_DIW_TEST_KEEP_SCARF=1 keeps it
+    ("cube25", "classic.scarf", {"seam_slope_type": "external"}, KEEP_SCARF),
+    ("ring", "classic.scarf", {"seam_slope_type": "external"}, KEEP_SCARF),
+    ("lshape", "arachne.scarf_all", {"seam_slope_type": "all", "wall_generator": "arachne"}, KEEP_SCARF),
     ("cube25", "classic.policy_error", {"diw_powder_overflow_policy": "error"}, {}),
     ("cone", "classic.policy_error", {"diw_powder_overflow_policy": "error"}, {}),
 ]
@@ -413,8 +479,8 @@ def assemble_list(mdir, part, out_dir):
 
 
 def mesh_files(mdir, part):
-    if part in PLATES or part in STRESS_PLATES:
-        names, args = PLATES[part] if part in PLATES else STRESS_PLATES[part]
+    if part in PLATES or part in STRESS_PLATES or part in G4_PLATES:
+        names, args = PLATES[part] if part in PLATES else STRESS_PLATES[part] if part in STRESS_PLATES else G4_PLATES[part]
     else:
         names, args = [part], []
     files = []
@@ -496,7 +562,7 @@ def new_stats():
 def run_tr(tr, argv, env_extra=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ORCA_DIW_")}
     env.update(env_extra or {})
-    r = subprocess.run([tr] + argv, capture_output=True, cwd=os.path.dirname(tr), env=env)
+    r = subprocess.run([tr] + tr_argv(argv), capture_output=True, cwd=os.path.dirname(tr), env=env)
     return r.returncode, r.stderr.decode("utf-8", "replace").strip()
 
 
@@ -1209,7 +1275,7 @@ def scarf_checks(E, sg, shapely, B, H, CP, chk, stats, info, name, sdir, job, ov
     with open(v2rec_path, "wb") as fh:
         fh.write(v2rec)
     tr_v2 = os.path.join(sdir, "v2rec.translated.gcode")
-    rc2, err2 = run_tr(tr, ["--config-from-gcode", v2rec_path, tr_v2])
+    rc2, err2 = run_tr(tr, ["--config-from-gcode", "--v2-parity", v2rec_path, tr_v2])
     if chk.check("T2e", f"{name}.v2_translate", rc2 == 0, f"rc={rc2} {err2[-200:]}" if rc2 else "") and \
             os.path.isfile(tr_nat):
         fb_ks = {k for k, b in nat.items() if b.fbs} | {L.k for L in moved if L.plan is not None and L.plan.fallback_paths}
@@ -1315,6 +1381,21 @@ def slice_job(job):
             info["tower"] = b"; FEATURE: Prime tower" in kill or b";TYPE:Prime tower" in kill or b"Wipe tower" in kill
         warns = [l.decode(errors="replace").strip()[:200] for l in res["on"][2].splitlines() if WARN in l]
         info["warnings"] = warns
+        # coverage counters (increment 5, PRODUCT_DESIGN.md section 8): blocks by st, ;DIW:FB lines, k with FB
+        st, fbk, nfb, kcur = {}, set(), 0, None
+        for l in on.split(b"\n"):
+            if l.startswith(b";DIW:BEGIN"):
+                f = begin_fields(l.decode("ascii", "replace").strip())
+                kcur = int(f["k"])
+                st[f["st"]] = st.get(f["st"], 0) + 1
+            elif l.startswith(b";DIW:FB"):
+                nfb += 1
+                fbk.add(kcur)
+        info["st"], info["fb_lines"], info["fb_k"] = st, nfb, sorted(fbk)
+        info["open_noncarrier"] = open_noncarrier(on)
+        if job.get("expect") is not None:
+            got = {"st": st, "fb": nfb, "fb_k": sorted(fbk)}
+            chk.check("COV", f"{name}.expect", got == job["expect"], f"got {got}, frozen {job['expect']}")
         if job.get("stress"):
             stress_reach(E, chk, info, name, part, ov, kill, on)
             if ov.get("diw_powder_overflow_policy") == "error":
@@ -1416,7 +1497,7 @@ def slice_job(job):
         with open(v2rec_path, "wb") as fh:
             fh.write(v2rec)
         tr_v2 = os.path.join(sdir, "v2rec.translated.gcode")
-        rc2, err2 = run_tr(tr, ["--config-from-gcode", v2rec_path, tr_v2])
+        rc2, err2 = run_tr(tr, ["--config-from-gcode", "--v2-parity", v2rec_path, tr_v2])
         if chk.check("T2e", f"{name}.v2_translate", rc2 == 0, f"rc={rc2} {err2[-200:]}" if rc2 else "") and \
                 os.path.isfile(tr_nat):
             fb_ks = {k for k, b in nat.items() if b.fbs} | {L.k for L in layers if L.plan is not None and L.plan.fallback_paths}
@@ -1503,6 +1584,7 @@ def slice_only_job(job):
         for b in blocks:
             st[b.st] = st.get(b.st, 0) + 1
         info["st"] = st
+        info["open_noncarrier"] = open_noncarrier(on)
 
         summ = parse_summary(log)
         info["summary"] = summ
@@ -1841,6 +1923,7 @@ def t5_job(job):
             chk.check("T5ii", f"{name}.{tag}.summary_clean", summ is not None and not badr and not summ["disabled"]
                       and summ["max_held"] <= 1, f"summary {summ}")
             res[tag] = (data, os.path.join(od, "plate_1.gcode"), load_dumps(dd), cb)
+            info.setdefault("open_noncarrier", []).extend(open_noncarrier(data))
         if len(res) != 2:
             return {"name": name, "records": chk.records, "logs": chk.logs, "stats": stats, "info": info}
         (on0, path0, dumps0, cb0), (on15, path15, dumps15, cb15) = res["gap0"], res["gap15"]
@@ -2117,6 +2200,21 @@ def main_matrix(argv):
         d = float(ov["diw_shell_powder_clearance"]) if "diw_shell_powder_clearance" in ov else None
         jobs.append({"part": part, "variant": vname, "overrides": ov, "work": work, "orca": orca, "translate": tr,
                      "datadir": datadir, "engine": engine, "mdir": mdirs[d], "reuse": opt(argv, "--reuse")})
+    extra = opt(argv, "--extra")
+    if extra:
+        # increment-5 coverage set (coverage_slices.json): full slice_job with the frozen counts checked
+        with open(extra, encoding="utf-8") as fh:
+            cov = json.load(fh)
+        cdir = make_meshes(work, float(cov["mesh_delta"])) if cov.get("mesh_delta") is not None else mdirs[None]
+        # the coverage counters apply to a set whose slices have roles (coverage_slices.json); g4_slices.json has none
+        cov_roles = any(s.get("role") for s in cov["slices"])
+        for s in cov["slices"]:
+            name = f"{s['part']}.{s['variant']}"
+            if only and only not in name:
+                continue
+            jobs.append({"part": s["part"], "variant": s["variant"], "overrides": dict(s["overrides"]), "work": work,
+                         "orca": orca, "translate": tr, "datadir": datadir, "engine": engine, "mdir": cdir,
+                         "reuse": None, "expect": s.get("expect"), "role": s.get("role"), "env": dict(s.get("env") or {})})
     for part, vname, ov, env in (STRESS if stress else []):
         name = f"{part}.{vname}"
         if only and only not in name:
@@ -2178,6 +2276,34 @@ def main_matrix(argv):
                 tot[key] = max(tot.get(key, 0.0), v)
             else:
                 tot[key] = tot.get(key, 0) + v
+    if extra and cov_roles:
+        fb_sl = [r["name"] for r in results if r["info"].get("fb_lines", 0) > 0]
+        sm_sl = [r["name"] for r in results if r["info"].get("st", {}).get("small", 0) > 0]
+        nfb = sum(r["info"].get("fb_lines", 0) for r in results)
+        nsm = sum(r["info"].get("st", {}).get("small", 0) for r in results)
+        print(f"coverage counters: fb_lines {nfb} on {len(fb_sl)} slice(s) {fb_sl}; small_blocks {nsm} on "
+              f"{len(sm_sl)} slice(s) {sm_sl}")
+        for nm, ok, d in (("COV.fb_slices", len(fb_sl) >= 2, f"{len(fb_sl)} slices with ;DIW:FB lines (>= 2)"),
+                          ("COV.small_slices", len(sm_sl) >= 1, f"{len(sm_sl)} slices with st=small blocks (>= 1)")):
+            rep.n += 1
+            k = by_kind.setdefault("COV", [0, 0])
+            k[0] += 1
+            if not ok:
+                k[1] += 1
+                rep.fails.append(f"{nm}: {d}")
+    if powder_mode() == "shadow":
+        # S0 (PRODUCT_DESIGN.md 8): no native non-carrier st=open block in any shadow export, so a future native
+        # P0 / P1c st=open shows up here and not as a translator refusal
+        opn = {r["name"]: r["info"]["open_noncarrier"] for r in results if r["info"].get("open_noncarrier")}
+        nexp = sum(1 for r in results if "open_noncarrier" in r["info"])
+        print(f"S0 native non-carrier st=open blocks: {sum(len(v) for v in opn.values())} in {nexp} export set(s)"
+              + (f" {opn}" if opn else ""))
+        rep.n += 1
+        k = by_kind.setdefault("S0", [0, 0])
+        k[0] += 1
+        if opn or nexp == 0:
+            k[1] += 1
+            rep.fails.append(f"S0.native_open_noncarrier: {opn if opn else 'no export parsed'}")
     if tot.get("components", 0):
         d5, sc = tot.get("d5_excluded", 0), tot["components"]
         rep.n += 1
@@ -2233,6 +2359,10 @@ def main_matrix(argv):
 
 
 def main(argv):
+    m = set_powder_mode(argv)
+    if m:
+        print(f"powder mode: {m} (ORCA_DIW_POWDER_MODE={m} on every export"
+              + (", --v2-parity on every translation)" if m == "shadow" else ")"), flush=True)
     if "--matrix" in argv:
         return main_matrix(argv)
     return main_stage4(argv)
