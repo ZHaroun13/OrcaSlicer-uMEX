@@ -252,7 +252,7 @@ bool get_bool(const DynamicPrintConfig &c, const char *key, bool def)
 DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &c)
 {
     Params p;
-    p.a_mode = diwaFlowScaled;
+    p.a_mode = Params::kAIncremental;
     p.df = get_float(c, "filament_diameter", p.df);
     const double d_syringe = get_float(c, "diw_syringe_diameter", 50.);
     // B from the paste volume each move needs: dV = dE * pi/4 * df^2, dB = dV / (pi/4 * D^2) = dE * (df/D)^2.
@@ -269,6 +269,11 @@ DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &c)
     p.max_retract_de    = get_float(c, "diw_retraction_max_length", p.max_retract_de);
     p.max_retract_f     = get_float(c, "diw_retraction_max_speed", 5.) * 60.;
     p.post_dwell        = get_float(c, "diw_post_extrusion_dwell", p.post_dwell);
+    // Audit-fix settings (diw/AUDIT_FIX.md). They are not PrintConfig keys (PrintConfig.hpp is reserved for increment 7),
+    // so these names are read only when a config carries them; DIWTranslateOptions overrides them.
+    p.m62_pre_dwell     = get_float(c, "diw_m62_pre_dwell", p.m62_pre_dwell);
+    p.suckback_e        = get_float(c, "diw_suckback_length", p.suckback_e);
+    p.suckback_f        = get_float(c, "diw_suckback_feed", p.suckback_f);
     if (const auto *o = c.option<ConfigOptionString>("diw_uv_on_gcode")) p.uv_on = strip(o->value);
     if (const auto *o = c.option<ConfigOptionString>("diw_uv_off_gcode")) p.uv_off = strip(o->value);
     // An empty UV-on command means there is no UV lamp (v2: enable_uv_io = False).
@@ -425,6 +430,11 @@ private:
     // core layers through process_line() and curing_sequence(), as v2's _UMexMixin does.
     bool speed_mode() const override { return P.a_mode == diwaFlowScaled || P.a_mode == diwaProportional; }
 
+    bool   sucked_back = false;   // suck-back taken at the end of an extrusion and not yet re-primed
+    Lines  suckback_lines();
+    Lines  reprime_lines();
+    std::string b_word(double total);
+    std::string a_word_incremental(double total);
     Lines  umex_shutdown_lines();
     Lines  umex_banner() const;
     std::string sanitize_dwell(const std::string &tok, const std::string &code, const std::string &comment_suffix);
@@ -455,6 +465,8 @@ void Translator::compute_geometric_center(const std::vector<std::string> &raw_li
 Translator::Lines Translator::curing_sequence(double return_x, double return_y)
 {
     Lines m;
+    if (is_extruding)
+        append(m, suckback_lines());   // audit #16 (off by default): relieve the paste before leaving the part
     if (speed_mode())
         m.emplace_back("G1 A0.000\n");
     is_extruding = false;
@@ -478,6 +490,50 @@ Translator::Lines Translator::trigger_final_curing()
             return curing_sequence(cur_x, cur_y);
     }
     return {};
+}
+
+// Audit #16 (default off, suckback_e = 0): when paste extrusion ends, B is pulled back by suckback_e mm of paste
+// (dB = delta_b(-suckback_e)) at suckback_f (default: the retract clamp). The next extrusion starts with the matching
+// re-prime. No A word (A only ever advances).
+Translator::Lines Translator::suckback_lines()
+{
+    if (P.suckback_e <= 0. || sucked_back)
+        return {};
+    cumulative_b -= delta_b(P.suckback_e);
+    sucked_back = true;
+    const double f = P.suckback_f > 0. ? P.suckback_f : P.max_retract_f;
+    return { "G1 B" + b_word(cumulative_b) + " F" + format_num("%.1f", f) + " ; suck-back\n" };
+}
+
+Translator::Lines Translator::reprime_lines()
+{
+    if (! sucked_back)
+        return {};
+    cumulative_b += delta_b(P.suckback_e);
+    sucked_back = false;
+    const double f = P.suckback_f > 0. ? P.suckback_f : P.max_retract_f;
+    return { "G1 B" + b_word(cumulative_b) + " F" + format_num("%.1f", f) + " ; suck-back re-prime\n" };
+}
+
+// B / A words. Absolute modes write the running position (%.4f); the incremental mode writes the delta that takes
+// the emitted total to the exact total, quantised to 1e-5 (B) / 1e-4 (A) with the rounding residual carried, so the
+// running sum of the words never drifts more than half a unit from the exact position.
+std::string Translator::b_word(double total)
+{
+    if (P.a_mode != Params::kAIncremental)
+        return format_num("%.4f", total);
+    const long long units = std::llround(total * 1e5);
+    const long long d     = units - emitted_b_units;
+    emitted_b_units       = units;
+    return format_num("%.5f", double(d) / 1e5);
+}
+
+std::string Translator::a_word_incremental(double total)
+{
+    const long long units = std::llround(total * 1e4);
+    const long long d     = units - emitted_a_units;
+    emitted_a_units       = units;
+    return format_num("%.4f", double(d) / 1e4);
 }
 
 double Translator::delta_b(double delta_e) const
@@ -709,6 +765,8 @@ Translator::Lines Translator::process_line(const std::string &raw_line)
     if (tok == "G92") {
         if (WordMatch em = find_word(code, "E")) {
             last_e       = em.value;
+            if (P.a_mode == Params::kAIncremental)   // deltas: the E reset needs no axis command, the totals run on
+                return { "; (FILTERED) " + code + comment_suffix + "\n" };
             cumulative_b = 0.;
             std::string replacement = "B0.0000";
             if (P.a_mode == diwaCumulative) {
@@ -755,6 +813,7 @@ Translator::Lines Translator::motion_block(const std::string &code, const std::s
         // Extrusion: syringe B by volume, auger A by the selected mode.
         extruded_on_layer      = true;
         cured_for_layer_change = false;
+        append(out, reprime_lines());
         cumulative_b += delta_b(de);
         const bool stationary = (dx == 0 && dy == 0) || (std::abs(dx) < 1e-7 && std::abs(dy) < 1e-7);
         double a = 0.;
@@ -765,6 +824,14 @@ Translator::Lines Translator::motion_block(const std::string &code, const std::s
         else if (P.a_mode == diwaCumulative) {
             cumulative_a += ds > 0.0001 ? ds * P.k_screw : de * P.k_screw;
             a = cumulative_a;
+        } else if (P.a_mode == Params::kAIncremental) {
+            // Audit (3.0 item 1): G91.2, dA = K_E * dE (K_E = diw_k_screw) and dB = ratio * kB * dE, per extrusion block.
+            cumulative_a += de * P.k_screw;
+            is_extruding = true;
+            const std::string bw = b_word(cumulative_b);
+            const std::string aw = a_word_incremental(cumulative_a);
+            out.push_back(collapse_ws(replace_words(code, "E", "") + " B" + bw + " A" + aw) + comment_suffix + "\n");
+            return out;
         }
         is_extruding = true;
         out.push_back(collapse_ws(replace_words(code, "E", "") + " B" + format_num("%.4f", cumulative_b) + " A" + format_num("%.3f", a)) +
@@ -788,6 +855,10 @@ Translator::Lines Translator::motion_block(const std::string &code, const std::s
             const std::string fstr = "F" + format_num("%.1f", f_retract);
             const std::string with_f = find_word(no_e, "F") ? replace_words(no_e, "F", fstr) : no_e + " " + fstr;
             is_extruding = false;
+            if (P.a_mode == Params::kAIncremental) {   // negative dB; no A word (no reverse A)
+                out.push_back(collapse_ws(with_f + " B" + b_word(cumulative_b)) + comment_suffix + "\n");
+                return out;
+            }
             out.push_back(collapse_ws(with_f + " B" + format_num("%.4f", cumulative_b) + " A" + format_num("%.3f", a)) + comment_suffix + "\n");
             return out;
         }
@@ -798,11 +869,33 @@ Translator::Lines Translator::motion_block(const std::string &code, const std::s
     if (is_extruding) {
         if (P.post_dwell > 0.)
             out.push_back("G04 P" + format_num("%.2f", P.post_dwell) + "\n");
+        append(out, suckback_lines());
         if (speed_mode())
             sanitized += " A0.000";
         is_extruding = false;
     }
     out.push_back(collapse_ws(sanitized) + comment_suffix + "\n");
+    return out;
+}
+
+// Audit #8 (default off): a G04 before every M62, so the output is not switched while a motion block is still
+// running. A line that already follows a G04 (the UV exposure dwell) is left alone.
+static std::string insert_m62_dwell(const std::string &body, double dwell)
+{
+    std::string out;
+    out.reserve(body.size() + body.size() / 16);
+    bool prev_g04 = false;
+    for (size_t pos = 0; pos < body.size();) {
+        const size_t nl   = body.find('\n', pos);
+        const size_t end  = nl == std::string::npos ? body.size() : nl + 1;
+        const std::string line = body.substr(pos, end - pos);
+        const std::string up   = to_upper(strip(line));
+        if (up.compare(0, 4, "M62 ") == 0 && ! prev_g04)
+            out += "G04 P" + format_num("%.2f", dwell) + " ; settle before M62\n";
+        prev_g04 = up.compare(0, 3, "G04") == 0 || up.compare(0, 2, "G4") == 0;
+        out += line;
+        pos = end;
+    }
     return out;
 }
 
@@ -853,8 +946,13 @@ std::string Translator::run(const std::vector<std::string> &raw_lines, const std
     }
     for (const std::string &l : finalize())
         body += l;
+    if (P.m62_pre_dwell > 0.)
+        body = insert_m62_dwell(body, P.m62_pre_dwell);
 
     std::string out = std::string(DIW_TRANSLATION_HEADER) + "\n";
+    // Audit (3.0 item 1): the ABC axes are incremental (G91.2); XYZ stay absolute (G90 only sets XYZ in PlanetCNC TNG).
+    if (P.a_mode == Params::kAIncremental)
+        out += "G91.2 ; ABC incremental: A and B words are deltas\n";
     if (P.umex)
         for (const std::string &l : umex_banner())
             out += l;
@@ -950,7 +1048,13 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
             throw DIWConfigError("u-MEX powder infill: this G-code has no powder plan (;DIW: records). Export it again "
                                  "from OrcaSlicer with u-MEX powder infill on; the plan is written during the export.");
     }
-    Translator t(p, opts.stub_powder_stage, opts.v2_parity);
+    Params pp = p;
+    if (opts.m62_pre_dwell >= 0.) pp.m62_pre_dwell = opts.m62_pre_dwell;
+    if (opts.suckback_e >= 0.) pp.suckback_e = opts.suckback_e;
+    if (opts.suckback_f >= 0.) pp.suckback_f = opts.suckback_f;
+    if (opts.retract_f_max > 0.) pp.max_retract_f = opts.retract_f_max;
+    if (opts.a_mode >= 0) pp.a_mode = opts.a_mode;
+    Translator t(pp, opts.stub_powder_stage, opts.v2_parity);
     return t.run(lines, blocks);
 }
 

@@ -51,6 +51,20 @@ struct DIWTranslateOptions
     // with v2's warning). Without it (production) such a block is a DIWConfigError. Every harness that translates
     // records made by v2 sets it.
     bool v2_parity = false;
+
+    // Audit fix (diw/AUDIT_FIX.md). Translator-level settings, not PrintConfig keys (PrintConfig.hpp is reserved for
+    // increment 7); each one overrides the config only when set. All off / unchanged by default.
+    // G04 (seconds) written before every M62 (audit #8: TNG's M62 timing is undocumented). 0 = none.
+    double m62_pre_dwell = -1.;
+    // Suck-back (audit #16): when paste extrusion ends, B is pulled back by this much paste (E mm of the virtual
+    // filament, as the retraction limits are) and re-primed before the next extrusion. 0 = off.
+    double suckback_e = -1.;
+    // Suck-back feed in mm/min; <= 0 = the retract clamp.
+    double suckback_f = -1.;
+    // Feed clamp of a B retraction in mm/min (audit #17); <= 0 = the config's diw_retraction_max_speed (default 5 mm/s = 300).
+    double retract_f_max = -1.;
+    // A axis mode (DIWAxisAMode number, 3 = incremental); < 0 = the config's diw_a_axis_mode.
+    int a_mode = -1;
 };
 
 // Translates G-code text. Line endings of the output are '\n'. Throws DIWConfigError

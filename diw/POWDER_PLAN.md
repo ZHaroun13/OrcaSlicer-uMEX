@@ -473,3 +473,19 @@ its log path), `t0_s1` ... `t0_s7` (T0), `s1` (T7, G6, coverage), `s2` (T11), `s
   fills the last layer), or an error?
 - `infill_combination` on a powder job (Q4): a validation error (used now), or forced off silently like the scarf
   seam?
+
+## Audit fix results (19 Nov 2026)
+
+The G-code command layer follows `Audit_file.pdf` (details in `AUDIT_FIX.md`): incremental ABC mode, `G91.2` in the
+header (XYZ stay G90). Each extrusion block writes dA = K_E*dE (K_E = `diw_k_screw` = 3.48) and
+dB = 0.001225*kB*dE as deltas; retraction and suck-back are negative dB; travel, curing and other non-extruding moves
+write no A or B. Optional M62 dwell, suck-back and retract feed clamp (default off). The default `diw_a_axis_mode` is
+`incremental`; the old modes, T0, `--v2-parity` and G5 v2open parity stay on v2's modes.
+
+| Gate | Result |
+|---|---|
+| `audit_gate.py` | 0 failures; cube25 408 A words, 0 A/B on travel. |
+| Catch2 | 4805 assertions in 55 test cases. |
+| T0 (`audit\t0inc`) | 157 / 157 / 486 ok; `compare_powder`, `compare_v2` 0 failures. |
+| G5, G6 | 78 and 117 checks, 0 failures. |
+| Full build | exit code 0. |

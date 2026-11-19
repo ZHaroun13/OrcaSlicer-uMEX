@@ -242,7 +242,8 @@ CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(GCodeFlavor)
 static t_config_enum_values s_keys_map_DIWAxisAMode {
     { "flow_scaled",    diwaFlowScaled },
     { "proportional",   diwaProportional },
-    { "cumulative",     diwaCumulative }
+    { "cumulative",     diwaCumulative },
+    { "incremental",    3 }   // audit fix: DIW::TranslatorParams::kAIncremental (no enumerator, PrintConfig.hpp untouched)
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(DIWAxisAMode)
 
@@ -9124,12 +9125,16 @@ void PrintConfigDef::init_fff_params()
 
     // ---- filament (paste + powder material) ----
     def = diw_def("diw_a_axis_mode", coEnums, L("Auger (A axis) mode"),
-                  L("How the printhead auger is commanded: speed scaled by flow, speed proportional to feed, "
-                    "or cumulative position."));
+                  L("How the printhead auger is commanded. Incremental (default, G91.2): A and B are written as deltas, "
+                    "dA = K x dE and dB = ratio x kB x dE, only on extrusion moves (negative dB for retraction); never "
+                    "on travel. The other modes are the legacy ones: speed scaled by flow, speed proportional to feed, "
+                    "or cumulative position by path length."));
     def->enum_keys_map = &ConfigOptionEnum<DIWAxisAMode>::get_enum_values();
-    def->enum_values  = { "flow_scaled", "proportional", "cumulative" };
-    def->enum_labels  = { L("Flow-scaled speed"), L("Proportional speed"), L("Cumulative position") };
-    def->set_default_value(new ConfigOptionEnumsGeneric{ (int)diwaFlowScaled });
+    def->enum_values  = { "flow_scaled", "proportional", "cumulative", "incremental" };
+    def->enum_labels  = { L("Flow-scaled speed"), L("Proportional speed"), L("Cumulative position (path length)"),
+                          L("Incremental deltas (G91.2, K x dE)") };
+    // 3 = "incremental" (audit fix, diw/AUDIT_FIX.md); not an enumerator because PrintConfig.hpp is not changed here.
+    def->set_default_value(new ConfigOptionEnumsGeneric{ 3 });
 
     def = diw_def("diw_k_screw", coFloats, L("Auger constant K"), L("Scaling constant of the auger command."));
     def->min = 0;

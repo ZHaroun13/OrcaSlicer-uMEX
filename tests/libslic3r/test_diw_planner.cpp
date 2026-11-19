@@ -2,15 +2,19 @@
 // Built inside libslic3r_tests with BUILD_TESTS, and stand-alone as the dev-utils target diw_planner_tests.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
 
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/GCode/DIWPowderPlanner.hpp"
 #include "libslic3r/GCode/DIWPyCompat.hpp"
+#include "libslic3r/GCode/DIWTranslator.hpp"
+#include "libslic3r/PrintConfig.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <random>
@@ -443,4 +447,173 @@ TEST_CASE("v2 ring formation: snap and merge", "[diw_planner]")
     };
     const auto rings = rings_from_open_walls(walls);
     CHECK(rings.size() == 2);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Audit fix (diw/AUDIT_FIX.md): G91.2, A and B are per-block deltas (dA = K_E*dE, dB = ratio*kB*dE), only on extrusion/retraction.
+
+namespace {
+
+// Layer 1: extrude, retract, travel, re-prime, extrude, travel; layer 2: extrude. Relative E.
+const char *AUDIT_SRC =
+    ";LAYER_CHANGE\nM83\nG92 E0\nG1 X10 Y10 F1200\nG1 X20 Y10 E1.0 F1800\nG1 E-0.5 F2400\nG1 X30 Y30 F6000\n"
+    "G1 E0.5 F2400\nG1 X40 Y30 E1.0 F1800\nG1 X50 Y50 F6000\n;LAYER_CHANGE\nG1 X10 Y10 E1.0 F1800\nM84\n";
+
+std::vector<std::string> audit_translate(const DIWTranslateOptions &opts, int a_mode = -1)
+{
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    cfg.set_key_value("diw_printer", new ConfigOptionBool(true));
+    if (a_mode >= 0)
+        cfg.set_key_value("diw_a_axis_mode", new ConfigOptionEnumsGeneric{ a_mode });
+    const std::string out = diw_translate_gcode(AUDIT_SRC, cfg, opts);
+    std::vector<std::string> lines;
+    std::istringstream is(out);
+    for (std::string l; std::getline(is, l);) lines.push_back(l);
+    return lines;
+}
+
+bool has_word(const std::string &line, char w, double *v = nullptr)
+{
+    const std::string code = line.substr(0, line.find(';'));
+    std::istringstream is(code);
+    for (std::string t; is >> t;)
+        if (t[0] == w && t.size() > 1 && (std::isdigit(uint8_t(t[1])) || t[1] == '-' || t[1] == '.')) {
+            if (v) *v = std::stod(t.substr(1));
+            return true;
+        }
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("audit fix: incremental is the default A mode, G91.2 in the header", "[diw_planner][audit]")
+{
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    const auto *o = cfg.option<ConfigOptionEnumsGeneric>("diw_a_axis_mode");
+    REQUIRE(o != nullptr);
+    CHECK(o->values.front() == 3);
+    const auto lines = audit_translate(DIWTranslateOptions());
+    REQUIRE(lines.size() > 3);
+    CHECK(lines[1].rfind("G91.2", 0) == 0);
+    int n912 = 0;
+    for (const auto &l : lines) {
+        n912 += l.rfind("G91.2", 0) == 0;
+        CHECK(l.rfind("G90.2", 0) != 0);
+    }
+    CHECK(n912 == 1);
+    // the v2 modes keep the old header
+    const auto old = audit_translate(DIWTranslateOptions(), 0);
+    for (const auto &l : old) CHECK(l.rfind("G91.2", 0) != 0);
+}
+
+TEST_CASE("audit fix: dA = K_E*dE, dB = ratio*kB*dE per block, negative dB on retraction, nothing on travel", "[diw_planner][audit]")
+{
+    const double K_E = 3.48;   // diw_k_screw default
+    const auto lines = audit_translate(DIWTranslateOptions());
+    // blocks carrying A: E 1.0, 0.5 (re-prime), 1.0, 1.0 -> dA = K_E*dE; dB proportional to dE with a fixed factor c
+    const double dE_a[4] = { 1.0, 0.5, 1.0, 1.0 };
+    int n_a = 0;
+    double a_sum = 0., b_sum = 0., c = 0.;
+    for (const auto &l : lines) {
+        double a = 0., b = 0.;
+        const bool has_a = has_word(l, 'A', &a);
+        const bool has_b = has_word(l, 'B', &b);
+        CHECK(l.find("A0.000") == std::string::npos);
+        if (l.rfind("G0 ", 0) == 0) { CHECK_FALSE(has_a); CHECK_FALSE(has_b); }
+        if (has_a) {
+            REQUIRE(n_a < 4);
+            CHECK(has_b);
+            if (n_a == 0) c = b;                  // dB for dE = 1.0
+            CHECK(a == Catch::Approx(K_E * dE_a[n_a]).margin(1e-3));
+            CHECK(b == Catch::Approx(c * dE_a[n_a]).margin(2e-5));
+            ++n_a;
+            a_sum += a;
+        }
+        if (has_b) b_sum += b;
+    }
+    CHECK(n_a == 4);
+    CHECK(c == Catch::Approx(0.001225 * 1.01).margin(2e-5));
+    CHECK(a_sum == Catch::Approx(K_E * 3.5).margin(1e-3));
+    // net E = 1.0 - 0.5 + 0.5 + 1.0 + 1.0 = 3.0: the running dB sum equals ratio*kB*net E (residual carried, no drift)
+    CHECK(b_sum == Catch::Approx(c * 3.0).margin(2e-5));
+    // the retraction: negative dB, no A
+    int n_ret = 0;
+    for (const auto &l : lines) {
+        double b = 0.;
+        if (l.rfind("G1 F", 0) == 0 && has_word(l, 'B', &b) && ! has_word(l, 'A')) {
+            ++n_ret;
+            CHECK(b == Catch::Approx(-0.5 * c).margin(2e-5));
+            CHECK_FALSE(has_word(l, 'A'));
+        }
+    }
+    CHECK(n_ret == 1);
+    // the v2 mode still writes A0.000 on the first travel after an extrusion
+    const auto old = audit_translate(DIWTranslateOptions(), 0);
+    bool any_a0 = false;
+    for (const auto &l : old) any_a0 |= l.find("A0.000") != std::string::npos;
+    CHECK(any_a0);
+}
+
+
+TEST_CASE("audit fix: G04 before M62 setting", "[diw_planner][audit]")
+{
+    const auto off = audit_translate(DIWTranslateOptions());
+    DIWTranslateOptions on_opts;
+    on_opts.m62_pre_dwell = 0.25;
+    const auto on = audit_translate(on_opts);
+    auto count = [](const std::vector<std::string> &v, const char *pre) { size_t n = 0; for (const auto &l : v) n += l.rfind(pre, 0) == 0; return n; };
+    const size_t m62 = count(off, "M62");
+    REQUIRE(m62 > 0);
+    CHECK(count(on, "M62") == m62);
+    CHECK(count(on, "G04") > count(off, "G04"));
+    for (size_t i = 0; i < on.size(); ++i)
+        if (on[i].rfind("M62", 0) == 0) {
+            REQUIRE(i > 0);
+            CHECK(on[i - 1].rfind("G04", 0) == 0);   // every M62 follows a dwell
+        }
+    // default is off: identical to an explicit 0
+    DIWTranslateOptions zero;
+    zero.m62_pre_dwell = 0.;
+    CHECK(audit_translate(zero) == off);
+}
+
+TEST_CASE("audit fix: suck-back setting", "[diw_planner][audit]")
+{
+    const auto off = audit_translate(DIWTranslateOptions());
+    for (const auto &l : off) CHECK(l.find("suck-back") == std::string::npos);
+    DIWTranslateOptions o;
+    o.suckback_e = 0.4;
+    o.suckback_f = 200.;
+    const auto on = audit_translate(o);
+    int n_sb = 0, n_rp = 0;
+    for (const auto &l : on) {
+        double b = 0.;
+        if (l.find("suck-back re-prime") != std::string::npos) { ++n_rp; CHECK_FALSE(has_word(l, 'A')); CHECK(has_word(l, 'B', &b)); CHECK(b > 0.); }
+        else if (l.find("suck-back") != std::string::npos) { ++n_sb; CHECK_FALSE(has_word(l, 'A')); CHECK(has_word(l, 'B', &b)); CHECK(b < 0.); }
+    }
+    CHECK(n_sb >= 2);
+    CHECK(n_rp >= 1);
+    CHECK(n_rp <= n_sb);
+    // A deltas add up to the same total as without suck-back (suck-back moves B only; re-prime adds no A)
+    double a_sum_on = 0., a_sum_off = 0.;
+    for (const auto &l : on) { double a; if (has_word(l, 'A', &a)) { CHECK(a > 0.); a_sum_on += a; } }
+    for (const auto &l : off) { double a; if (has_word(l, 'A', &a)) a_sum_off += a; }
+    CHECK(a_sum_on == Catch::Approx(a_sum_off).margin(1e-3));
+}
+
+
+TEST_CASE("audit fix: retract feed clamp setting", "[diw_planner][audit]")
+{
+    auto retract_f = [](const std::vector<std::string> &v) {
+        for (const auto &l : v) {   // the retraction: B only plus a feed, in layer 1
+            double f = 0.;
+            if (l.rfind("G1 F", 0) == 0 && has_word(l, 'B') && has_word(l, 'F', &f)) return f;
+        }
+        return -1.;
+    };
+    const double def = retract_f(audit_translate(DIWTranslateOptions()));
+    DIWTranslateOptions o;
+    o.retract_f_max = 120.;
+    CHECK(def == Catch::Approx(300.));
+    CHECK(retract_f(audit_translate(o)) == Catch::Approx(120.));
 }

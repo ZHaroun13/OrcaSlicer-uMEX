@@ -11,6 +11,11 @@
 //   --v2-parity                 a non-carrier st=open block is left as paste with v2's warning instead of
 //                               stopping the translation (DIWTranslateOptions::v2_parity; tests that translate
 //                               records made by v2 only, PRODUCT_DESIGN.md 5.3)
+//   --product-defaults          keep the product default A mode (incremental, G91.2). Without it this tool uses v2's flow_scaled
+//                               unless diw_a_axis_mode is given (override or config block), so the v2 gates stay valid
+//   --m62-dwell <s>             G04 before every M62 (audit #8; DIWTranslateOptions::m62_pre_dwell)
+//   --suckback <E mm> [--suckback-feed <mm/min>]   suck-back at the end of an extrusion (audit #16)
+//   --retract-f-max <mm/min>    feed clamp of a B retraction (audit #17)
 //   diw_translate [--config-from-gcode <in.gcode>] --validate [key=value ...]
 //                               print diw_validate() of the settings (PRODUCT_DESIGN.md 6.2): one line
 //                               "error<TAB><opt_key><TAB><message>" or nothing, then one line
@@ -143,6 +148,8 @@ static int write_stdout(const std::string &s)
     return n == s.size() ? 0 : 1;
 }
 
+static bool g_product_defaults = false;
+
 // Default settings, optionally the input file's config block, diw_printer on, then key=value overrides.
 // Returns false (after printing the reason) for a malformed override.
 static bool build_config(DynamicPrintConfig &cfg, const std::string &in_path, bool config_from_gcode,
@@ -152,6 +159,23 @@ static bool build_config(DynamicPrintConfig &cfg, const std::string &in_path, bo
     if (config_from_gcode)
         cfg.load_from_gcode_file(in_path, ForwardCompatibilitySubstitutionRule::EnableSilent);
     cfg.set_key_value("diw_printer", new ConfigOptionBool(true));
+    // The v2 engine knows only the flow_scaled / proportional / cumulative A modes, and every comparison gate runs
+    // against it. The product default is now "incremental" (diw/AUDIT_FIX.md), so this tool keeps v2's flow_scaled
+    // unless the A mode is chosen explicitly (override, or the config block of the input with --config-from-gcode)
+    // or --product-defaults is given.
+    if (! g_product_defaults) {
+        bool explicit_a = false;
+        for (const std::string &o : overrides)
+            if (o.compare(0, 16, "diw_a_axis_mode=") == 0)
+                explicit_a = true;
+        if (config_from_gcode && ! explicit_a) {
+            std::string text;
+            if (read_file(in_path, text) && text.find("; diw_a_axis_mode") != std::string::npos)
+                explicit_a = true;
+        }
+        if (! explicit_a)
+            cfg.set_key_value("diw_a_axis_mode", new ConfigOptionEnumsGeneric{ int(diwaFlowScaled) });
+    }
     ConfigSubstitutionContext ctx(ForwardCompatibilitySubstitutionRule::Disable);
     for (const std::string &o : overrides) {
         const size_t eq = o.find('=');
@@ -428,6 +452,16 @@ int main(int argc, char **argv)
             opts.stub_powder_stage = true;
         else if (a == "--v2-parity")
             opts.v2_parity = true;
+        else if (a == "--product-defaults")
+            g_product_defaults = true;
+        else if (a == "--m62-dwell" && i + 1 < argc)
+            opts.m62_pre_dwell = std::stod(argv[++i]);
+        else if (a == "--suckback" && i + 1 < argc)
+            opts.suckback_e = std::stod(argv[++i]);
+        else if (a == "--suckback-feed" && i + 1 < argc)
+            opts.suckback_f = std::stod(argv[++i]);
+        else if (a == "--retract-f-max" && i + 1 < argc)
+            opts.retract_f_max = std::stod(argv[++i]);
         else if (a == "--validate")
             mode = Mode::Validate;
         else if (a == "--dump-records")

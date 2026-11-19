@@ -258,12 +258,21 @@ struct TranslatorParams
     bool   b_drivetrain      = false;
     double lead_b            = 4.;
     double i_gear_b          = 7.5;
-    int    a_mode            = 0;     // DIWAAxisMode (PrintConfig.hpp); diwaFlowScaled
+    // DIWAxisAMode (PrintConfig.hpp): 0 flow_scaled, 1 proportional, 2 cumulative (v2 modes); kAIncremental is the
+    // audit-fix mode (G91.2: dA = K_E*dE and dB as per-block deltas), the product default. It is not in the C++
+    // enum because PrintConfig.hpp is not touched here; PrintConfig.cpp maps "incremental" to the same number.
+    static constexpr int kAIncremental = 3;
+    int    a_mode            = kAIncremental;
     double k_screw           = 3.48;
     bool   enable_retraction = true;
     double max_retract_de    = 5.;
     double max_retract_f     = 300.;  // mm/min
     double post_dwell        = 0.;
+    // Audit fix (diw/AUDIT_FIX.md), all off by default: G04 before each M62 (s); suck-back when extrusion ends
+    // (E mm of paste taken back by B, feed in mm/min, 0 = the retract clamp).
+    double m62_pre_dwell     = 0.;
+    double suckback_e        = 0.;
+    double suckback_f        = 0.;
     bool   enable_uv         = true;
     std::string uv_on        = "M62 P3 Q1";
     std::string uv_off       = "M62 P3 Q0";
@@ -303,6 +312,7 @@ protected:
     double last_e = 0.;
     bool   relative_e = false;
     double cumulative_b = 0., cumulative_a = 0.;
+    long long emitted_a_units = 0, emitted_b_units = 0;   // incremental mode: what the deltas written so far add up to
     bool   is_extruding = false;
     bool   uv_active = false;
     int    layer_count = 0;
