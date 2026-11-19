@@ -550,7 +550,7 @@ int main(int argc, char **argv)
             return plan_records_mode(args[0], args[1], cfg, feed_size, plan_product, plan_no_suppress);
         }
         if (args.size() < 2) {
-            boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] [--allow-unconverted-powder] [--stub-powder-stage] [--v2-parity] <in.gcode> <out.gcode> [key=value ...]\n";
+            boost::nowide::cerr << "usage: diw_translate [--config-from-gcode] [--allow-unconverted-powder] [--stub-powder-stage] [--v2-parity] [--report] [--product-defaults] <in.gcode> <out.gcode> [key=value ...]\n";
             return 2;
         }
         DynamicPrintConfig cfg;

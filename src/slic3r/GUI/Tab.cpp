@@ -5883,6 +5883,9 @@ void TabPrinter::build_fff()
         optgroup->append_single_option_line("diw_b_drivetrain_units");
         optgroup->append_single_option_line("diw_b_gear_ratio");
         optgroup->append_single_option_line("diw_b_lead_screw_lead");
+        optgroup->append_single_option_line("diw_suckback_length");
+        optgroup->append_single_option_line("diw_suckback_feed");
+        optgroup->append_single_option_line("diw_m62_pre_dwell");
 
         optgroup = page->new_optgroup(L("UV curing"), L"param_special");
         optgroup->append_single_option_line("diw_uv_on_gcode");
@@ -6867,7 +6870,8 @@ void TabPrinter::toggle_options()
                                  "diw_powder_pin", "diw_powder_nozzle_diameter", "diw_powder_offset_x", "diw_powder_offset_y",
                                  "diw_powder_offset_z", "diw_powder_motor_voltage", "diw_powder_speed_max",
                                  "diw_powder_lag_on", "diw_powder_lag_off",
-                                 "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time" })
+                                 "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time",
+                                 "diw_suckback_length", "diw_suckback_feed", "diw_m62_pre_dwell" })
             toggle_option(key, is_diw);
         // The B gear ratio and lead only matter when B is written in motor revolutions.
         toggle_option("diw_b_gear_ratio", is_diw && m_config->opt_bool("diw_b_drivetrain_units"));

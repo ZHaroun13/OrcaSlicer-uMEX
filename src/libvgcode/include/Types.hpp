@@ -163,6 +163,8 @@ enum class EGCodeExtrusionRole : uint8_t
       Brim,
       SupportTransition,
       Mixed,
+      // DIW / u-MEX: powder hatch paths of the translator records (viewer only)
+      Powder,
     COUNT
 };
 

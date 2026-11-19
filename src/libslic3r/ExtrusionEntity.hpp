@@ -45,6 +45,8 @@ enum ExtrusionRole : uint8_t {
     erCustom,
     // Extrusion role for a collection with multiple extrusion roles.
     erMixed,
+    // DIW / u-MEX powder hatch paths drawn from the translator records (preview only, never exported by the slicer).
+    erPowder,
     erCount
 };
 

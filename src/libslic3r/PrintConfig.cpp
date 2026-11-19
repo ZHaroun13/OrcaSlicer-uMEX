@@ -9123,6 +9123,19 @@ void PrintConfigDef::init_fff_params()
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.5));
 
+    def = diw_def("diw_m62_pre_dwell", coFloat, L("Dwell before M62 switches"),
+                  L("Wait inserted before every M62 output switch (UV, powder, compaction) so the motion queue has drained. 0 = none."), L("s"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_suckback_length", coFloat, L("Syringe suck-back length"),
+                  L("Extra B retraction (in E mm of virtual filament) when the pressure is relieved. 0 = off."), L("mm"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.));
+    def = diw_def("diw_suckback_feed", coFloat, L("Syringe suck-back feed"),
+                  L("Feed rate of the suck-back move. 0 = use the maximum retraction speed."), L("mm/min"));
+    def->min = 0;
+    def->set_default_value(new ConfigOptionFloat(0.));
+
     // ---- filament (paste + powder material) ----
     def = diw_def("diw_a_axis_mode", coEnums, L("Auger (A axis) mode"),
                   L("How the printhead auger is commanded. Incremental (default, G91.2): A and B are written as deltas, "

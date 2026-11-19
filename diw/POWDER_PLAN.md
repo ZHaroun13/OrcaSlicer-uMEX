@@ -32,7 +32,7 @@ needed until milestone 5.
 | 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | **done** (18 Nov 2026): built and verified on the 191-slice matrix, T5 and the 10.1 stress variants; see "Increment 4 results" |
 | 5 | Product path: sparse infill suppressed on core layers, translator requires valid records, `seam_slope_type` forced off, validation rules | **done** (19 Nov 2026): product mode is the export default; its translated output equals shadow mode's on 228 slices; see "Increment 5 results" |
 | 6 | Added time and powder mass reported at export; documentation | **done** (19 Nov 2026): comment-only footer in the exported G-code, log lines, `diw_translate --report`; see "Increment 6 results" |
-| 7 | Milestone 5 (one full rebuild): preview / time estimate read the records, Powder role colour | |
+| 7 | Milestone 5 (one full rebuild): preview / time estimate read the records, Powder role colour, config keys | **done** (19 Nov 2026); see "Increment 7 results" |
 
 ## Increment 1 results (17 Nov 2026)
 
@@ -485,7 +485,7 @@ A paste job has no powder window and reports 0 g.
 (`DIWTranslateOptions::append_report = false`), so T0 and the v2-parity runs, which do not pass `--report`, keep their bytes;
 the production export turns it on. The slicer's own estimate line is repeated with the added time added to it
 (`slicer estimate = 9m 04s, with added time = 20m 30s`). The slicer's estimate does not yet include the u-MEX stages
-(increment 7 teaches the preview and the estimate about them).
+(increment 7 teaches the estimate and the preview about the powder stages; see "Increment 7 results").
 
 Cube25 product export (powder, default profile): powder mass 15.0527 g, deposition 144.737 s at 6.240 g/min over 32 layers
 (32 feeder passes), added time 686.281 s = pressure relief 6.4, wipe 119.911, UV 219.593, powder feed 227.95,
@@ -533,3 +533,29 @@ write no A or B. Optional M62 dwell, suck-back and retract feed clamp (default o
 | T0 (`audit\t0inc`) | 157 / 157 / 486 ok; `compare_powder`, `compare_v2` 0 failures. |
 | G5, G6 | 78 and 117 checks, 0 failures. |
 | Full build | exit code 0. |
+
+## Increment 7 results (19 Nov 2026)
+
+* Config keys: `diw_m62_pre_dwell` (s), `diw_suckback_length` (mm), `diw_suckback_feed` (mm/min), all default 0 (= off, so
+  the exported bytes are unchanged). The other requested settings were already keys (powder offsets, `diw_powder_z_clearance`,
+  `diw_powder_travel_hop`, mass flow, densities, `diw_retraction_max_speed` = retract_f_max); no duplicate key was added.
+  `diw_read_translator_params` reads them; env vars and CLI flags still override. GUI: printer page, "Syringe pump (B axis)".
+* Estimate: before the final `finalize()` the export runs the translator on the raw file, takes its per-layer added time
+  (`DIWTranslateOptions::layer_added_s`) and `GCodeProcessor::set_diw_layer_added_time` adds it to the totals, first layer
+  time, per-layer move times and the M73 cache. Only M73 lines, header statistics and one comment line
+  (`; DIW estimate includes added time = ... s`) change; the report footer subtracts the marker. Skipped for untranslated
+  exports (`ORCA_DIW_EXPORT_UNTRANSLATED`).
+* Preview: new role `erPowder` / `EGCodeExtrusionRole::Powder` (colour 222,170,40, legend entry). `GCodeProcessor` reads the
+  `;DIW:` blocks and emits viewer-only vertices (time 0, no volume) for each powder run.
+* Deferred: UV and compaction markers and FB paste paths in the preview. GUI rendering was not seen by the agent.
+
+| Gate | Result |
+|---|---|
+| Full build | exit code 0 (one full rebuild, plus one incremental fix) |
+| Catch2 `diw_planner_tests` | 4862 assertions in 62 test cases (new: key defaults, per-layer added time, estimate marker) |
+| T0 (`planner\t0inc7`) | 157 / 157 / 486 ok; pow and v2 0 failures |
+| `audit_gate.py` (cube25) | 0 failures |
+| G5, G6 | 78 and 117 checks, 0 failures |
+| Byte identity vs 94fec4a7 (default keys) | plain / small / kill plates and cube25 / lshape / ring translations identical after masking M73, statistics, timestamp and the 3 new key lines of the config footer |
+| Estimate, cube25 | Orca 9m 04s; translated export header 20m 30s = + 686.281 s; footer reads "slicer estimate = 9m 04s, with added time = 20m 30s" |
+| Keys through CLI | `--load-settings`, `--export-3mf` (project_settings) and the G-code config footer carry them; offsets X=7, Y=3 shift all 760 powder-moves by -7 / -3 (head = target - offset); `diw_m62_pre_dwell` 0.25 raised the estimate by 17.6 s |

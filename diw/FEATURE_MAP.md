@@ -68,8 +68,8 @@ Paths below are relative to `src/`.
 **Added time and powder mass report (increment 6).** Every exported u-MEX file ends with comment lines that give the powder
 mass (mass flow x deposition time) and the time the u-MEX stages add (dwells, powder feed and compaction moves, UV, wipe), at
 nominal feed and without acceleration, so treat it as a lower bound. The same lines go to the slicer log, and
-`diw_translate --report` prints them. They are comments only, so the machine motion does not change. Until increment 7 the
-slicer's own time estimate does not include these stages; the report adds them to it.
+`diw_translate --report` prints them. They are comments only, so the machine motion does not change. Since increment 7 the
+slicer's own estimate includes these stages; the report footer subtracts the included part again (marker line).
 
 ### F. Interim path (until native code lands)
 

@@ -420,6 +420,7 @@ static std::string to_string(libvgcode::EGCodeExtrusionRole role)
     case libvgcode::EGCodeExtrusionRole::Brim:                     { return _u8L("Brim"); }
     case libvgcode::EGCodeExtrusionRole::SupportTransition:        { return _u8L("Support transition"); }
     case libvgcode::EGCodeExtrusionRole::Mixed:                    { return _u8L("Mixed"); }
+    case libvgcode::EGCodeExtrusionRole::Powder:                   { return _u8L("Powder"); }
     default:                                                       { return _u8L("Unknown"); }
     }
 }
@@ -1685,7 +1686,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
             libvgcode::EGCodeExtrusionRole::WipeTower,
             // ORCA
             libvgcode::EGCodeExtrusionRole::BottomSurface, libvgcode::EGCodeExtrusionRole::InternalBridgeInfill, libvgcode::EGCodeExtrusionRole::Brim,
-            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed
+            libvgcode::EGCodeExtrusionRole::SupportTransition, libvgcode::EGCodeExtrusionRole::Mixed, libvgcode::EGCodeExtrusionRole::Powder
             });
     m_paths_bounding_box = BoundingBoxf3(libvgcode::convert(bbox[0]).cast<double>(), libvgcode::convert(bbox[1]).cast<double>());
     m_max_bounding_box = m_paths_bounding_box;

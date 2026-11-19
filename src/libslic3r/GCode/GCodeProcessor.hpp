@@ -806,6 +806,7 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
                 unsigned int id;
                 unsigned int remaining_internal_g1_lines{ 0 };
                 float elapsed_time;
+                unsigned int layer_id{ 0 };   // 1-based layer of the block (DIW added time, see apply_diw_added_time)
             };
 
             struct ActualSpeedMove
@@ -1362,6 +1363,8 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         bool m_in_config_block;
         unsigned int m_g1_line_id;
         unsigned int m_layer_id;
+        std::vector<double> m_diw_layer_added_s;
+        void apply_diw_added_time();
         CpColor m_cp_color;
         SeamsDetector m_seams_detector;
         OptionsZCorrector m_options_z_corrector;
@@ -1472,6 +1475,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         }
         void process_buffer(const std::string& buffer);
         void finalize(bool post_process);
+        // DIW / u-MEX (increment 7): time the translator adds per layer (index = number of ;LAYER_CHANGE lines before it,
+        // 0 = prelude), seconds. Call before finalize(); finalize adds it to the layer times, the total and the M73
+        // elapsed times. Nothing is written to the G-code motion.
+        void set_diw_layer_added_time(std::vector<double> added_s) { m_diw_layer_added_s = std::move(added_s); }
 
         double get_time(PrintEstimatedStatistics::ETimeMode mode) const;
         float get_prepare_time(PrintEstimatedStatistics::ETimeMode mode) const;
@@ -1497,6 +1504,12 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
         // Process tags embedded into comments
         void process_tags(const std::string_view comment, bool producers_enabled);
         bool process_producers_tags(const std::string_view comment);
+        // DIW / u-MEX (increment 7): collects one ;DIW:BEGIN .. ;DIW:END record block and draws its powder hatch paths as
+        // viewer-only Powder vertices. Returns true for a ;DIW: line. No time block is created.
+        bool process_diw_record(const std::string_view comment);
+        void store_diw_powder_vertices();
+        std::string m_diw_block;
+        bool        m_diw_in_block{ false };
         bool process_bambuslicer_tags(const std::string_view comment);
         bool process_cura_tags(const std::string_view comment);
         bool process_simplify3d_tags(const std::string_view comment);

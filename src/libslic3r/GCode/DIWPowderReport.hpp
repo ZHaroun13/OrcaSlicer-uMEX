@@ -50,9 +50,19 @@ struct PowderReport
     int    powder_windows         = 0;   // feeder on/off pairs (hatch runs and point dwells)
     double m_dot                  = 0.;  // g/min, as used
     double slicer_estimate_s      = -1.; // "estimated printing time (normal mode)" of the file, -1 = not found
+    // Increment 7: the slicer put the added time into its own estimate and says so in a comment at the end of the
+    // raw file (estimate_marker()); then slicer_estimate_s is the estimate WITHOUT the added time. -1 = no marker.
+    double estimate_includes_s    = -1.;
+    // The added time per layer: index = number of ;LAYER_CHANGE lines seen before the time (0 = before the first
+    // layer change). Sums to total_s().
+    std::vector<double> layer_added_s;
 
     double total_s() const { double t = 0.; for (double v : part_s) t += v; return t; }
 };
+
+// "; DIW estimate includes added time = <s> s": written by the slicer at the end of the raw file when its time
+// estimate already contains the added time (so the report does not count it twice).
+std::string estimate_marker(double added_s);
 
 // Scans the translated G-code. Throws Slic3r::RuntimeError with the line number for a malformed M62 or G04 word.
 PowderReport analyze_translated_gcode(const std::string &gcode, const PowderReportParams &params);

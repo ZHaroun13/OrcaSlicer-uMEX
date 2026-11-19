@@ -17,6 +17,7 @@ namespace DIW {
 namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr std::string_view kEstimateMarker = "; DIW estimate includes added time = ";
 
 std::string fixed(double v, int prec)
 {
@@ -146,7 +147,11 @@ PowderReport analyze_translated_gcode(const std::string &gcode, const PowderRepo
     bool   prev_code_g0 = false, uv_positioned = false, expect_return = false;
     double prev_g0_s = 0.;
 
+    size_t layer = 0;
     auto add = [&](PowderReport::Part part, double s, bool dwell) {
+        if (R.layer_added_s.size() <= layer)
+            R.layer_added_s.resize(layer + 1, 0.);
+        R.layer_added_s[layer] += s;
         R.part_s[part] += s;
         (dwell ? R.dwell_s : R.move_s) += s;
     };
@@ -171,8 +176,16 @@ PowderReport analyze_translated_gcode(const std::string &gcode, const PowderRepo
         if (! line.empty() && line.back() == '\r')
             line.pop_back();
 
+        if (line.compare(0, 13, ";LAYER_CHANGE") == 0)
+            ++layer;
         if (const double est = parse_slicer_estimate(line); est >= 0.)
             R.slicer_estimate_s = est;
+        if (line.compare(0, kEstimateMarker.size(), kEstimateMarker) == 0) {
+            double v = 0.;
+            const size_t e = line.find(" s", kEstimateMarker.size());
+            if (e != std::string::npos && parse_number(std::string_view(line).substr(kEstimateMarker.size(), e - kEstimateMarker.size()), v))
+                R.estimate_includes_s = v;
+        }
         Ctx new_ctx;
         if (stage_header(line, new_ctx)) {
             ctx = new_ctx;
@@ -291,7 +304,14 @@ PowderReport analyze_translated_gcode(const std::string &gcode, const PowderRepo
         }
     }
     R.powder_mass_g = P.m_dot / 60. * R.powder_deposition_s;
+    if (R.estimate_includes_s >= 0. && R.slicer_estimate_s >= 0.)
+        R.slicer_estimate_s = std::max(0., R.slicer_estimate_s - R.estimate_includes_s);
     return R;
+}
+
+std::string estimate_marker(double added_s)
+{
+    return std::string(kEstimateMarker) + fixed(added_s, 3) + " s\n";
 }
 
 std::string format_duration(double seconds)

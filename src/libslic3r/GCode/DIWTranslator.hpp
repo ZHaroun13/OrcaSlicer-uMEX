@@ -52,8 +52,8 @@ struct DIWTranslateOptions
     // records made by v2 sets it.
     bool v2_parity = false;
 
-    // Audit fix (diw/AUDIT_FIX.md). Translator-level settings, not PrintConfig keys (PrintConfig.hpp is reserved for
-    // increment 7); each one overrides the config only when set. All off / unchanged by default.
+    // Audit fix (diw/AUDIT_FIX.md). Translator-level overrides of the PrintConfig keys diw_m62_pre_dwell / diw_suckback_length /
+    // diw_suckback_feed / diw_retraction_max_speed (increment 7); each one overrides the config only when set. All off / unchanged by default.
     // G04 (seconds) written before every M62 (audit #8: TNG's M62 timing is undocumented). 0 = none.
     double m62_pre_dwell = -1.;
     // Suck-back (audit #16): when paste extrusion ends, B is pulled back by this much paste (E mm of the virtual
@@ -72,6 +72,8 @@ struct DIWTranslateOptions
     bool append_report = false;
     // When not null, receives the report's summary lines (no leading ';') whether or not append_report is set.
     std::vector<std::string> *report_lines = nullptr;
+    // Increment 7: when not null, receives the added time per layer (DIW::PowderReport::layer_added_s), seconds.
+    std::vector<double> *layer_added_s = nullptr;
 };
 
 // Translates G-code text. Line endings of the output are '\n'. Throws DIWConfigError

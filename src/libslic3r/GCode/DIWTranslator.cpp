@@ -271,8 +271,8 @@ DIW::TranslatorParams diw_read_translator_params(const DynamicPrintConfig &c)
     p.max_retract_de    = get_float(c, "diw_retraction_max_length", p.max_retract_de);
     p.max_retract_f     = get_float(c, "diw_retraction_max_speed", 5.) * 60.;
     p.post_dwell        = get_float(c, "diw_post_extrusion_dwell", p.post_dwell);
-    // Audit-fix settings (diw/AUDIT_FIX.md). They are not PrintConfig keys (PrintConfig.hpp is reserved for increment 7),
-    // so these names are read only when a config carries them; DIWTranslateOptions overrides them.
+    // Audit-fix settings (diw/AUDIT_FIX.md), PrintConfig keys since increment 7 (default 0 = off);
+    // DIWTranslateOptions overrides them. The retract speed cap is diw_retraction_max_speed (above).
     p.m62_pre_dwell     = get_float(c, "diw_m62_pre_dwell", p.m62_pre_dwell);
     p.suckback_e        = get_float(c, "diw_suckback_length", p.suckback_e);
     p.suckback_f        = get_float(c, "diw_suckback_feed", p.suckback_f);
@@ -1058,11 +1058,13 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
     if (opts.a_mode >= 0) pp.a_mode = opts.a_mode;
     Translator t(pp, opts.stub_powder_stage, opts.v2_parity);
     std::string result = t.run(lines, blocks);
-    if (opts.append_report || opts.report_lines != nullptr) {
+    if (opts.append_report || opts.report_lines != nullptr || opts.layer_added_s != nullptr) {
         // Increment 6: the report reads the finished text, so it cannot change a motion byte; it is appended as comments.
         const DIW::PowderReport rep = DIW::analyze_translated_gcode(result, DIW::powder_report_params(pp));
         if (opts.report_lines != nullptr)
             *opts.report_lines = DIW::report_summary_lines(rep);
+        if (opts.layer_added_s != nullptr)
+            *opts.layer_added_s = rep.layer_added_s;
         if (opts.append_report) {
             if (! result.empty() && result.back() != '\n')
                 result += '\n';

@@ -1657,7 +1657,8 @@ static std::vector<std::string> s_Preset_printer_options {
     "diw_wiper_x_start", "diw_wiper_x_end", "diw_wiper_y", "diw_wiper_z", "diw_wiper_speed", "diw_wiper_z_hop", "diw_wiper_z_min",
     "diw_powder_pin", "diw_powder_nozzle_diameter", "diw_powder_offset_x", "diw_powder_offset_y", "diw_powder_offset_z",
     "diw_powder_motor_voltage", "diw_powder_speed_max", "diw_powder_lag_on", "diw_powder_lag_off",
-    "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time"
+    "diw_compaction_pin", "diw_compaction_z_hop", "diw_compaction_settle_time",
+    "diw_m62_pre_dwell", "diw_suckback_length", "diw_suckback_feed"
     };
 
 static std::vector<std::string> s_Preset_sla_print_options {

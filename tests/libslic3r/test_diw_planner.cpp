@@ -758,3 +758,30 @@ TEST_CASE("report: footer is comments only and leaves the translation bytes unch
     // off by default: no footer
     CHECK(plain.find("uMEX report") == std::string::npos);
 }
+
+TEST_CASE("increment 7: new config keys default to off", "[diw_planner][config]")
+{
+    const DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    for (const char *key : { "diw_m62_pre_dwell", "diw_suckback_length", "diw_suckback_feed" }) {
+        const ConfigOptionFloat *o = cfg.option<ConfigOptionFloat>(key);
+        REQUIRE(o != nullptr);
+        CHECK(o->value == 0.);
+    }
+}
+
+TEST_CASE("increment 7: the report carries the added time per layer and the estimate marker", "[diw_planner][report]")
+{
+    const DIW::PowderReport r = DIW::analyze_translated_gcode(REPORT_FIXTURE, report_params());
+    double sum = 0.;
+    for (double v : r.layer_added_s)
+        sum += v;
+    CHECK(sum == Catch::Approx(r.total_s()).margin(1e-9));
+    CHECK(r.estimate_includes_s < 0.);
+
+    // The slicer's estimate already contains 19.62 s: the report gives back the estimate without it.
+    const std::string with_marker = std::string(REPORT_FIXTURE) + DIW::estimate_marker(r.total_s());
+    const DIW::PowderReport m = DIW::analyze_translated_gcode(with_marker, report_params());
+    CHECK(m.estimate_includes_s == Catch::Approx(r.total_s()).margin(1e-3));
+    CHECK(m.slicer_estimate_s == Catch::Approx(651. - r.total_s()).margin(1e-3));
+    CHECK(m.total_s() == Catch::Approx(r.total_s()).margin(1e-9));
+}

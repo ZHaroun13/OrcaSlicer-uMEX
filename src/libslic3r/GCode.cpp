@@ -12,6 +12,8 @@
 #include "GCode/SmallAreaInfillFlowCompensator.hpp"
 #include "GCode/CoolingBuffer.hpp"
 #include "GCode/DIWPowderShadow.hpp"
+#include "GCode/DIWPowderReport.hpp"
+#include "GCode/DIWTranslator.hpp"
 #include "GCode/AdaptivePAProcessor.hpp"
 #include "CustomGCode.hpp"
 #include "GCode/TimelapsePosPicker.hpp"
@@ -75,6 +77,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <boost/nowide/fstream.hpp>
 #include <limits>
 #include <map>
 #include <math.h>
@@ -3081,6 +3084,41 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // (Print.cpp) for the device GUI, but that is too late for the in-finalize injector. Null for
     // single-nozzle prints, where the injector is gated off anyway (enable_pre_heating false).
     m_processor.result().nozzle_group_result = m_print->get_layered_nozzle_group_result();
+
+    // DIW / u-MEX increment 7: the machine translation runs after the export and adds time the slicer's planner cannot
+    // see (wipe, UV, powder pass, compaction). Translate the finished raw file once here, only to read the added time
+    // per layer, so the estimate, the layer times and the M73 lines include it. The exported motion is not touched:
+    // the only file change is one comment line at the end (the report must not count the time twice). Skipped for the
+    // untranslated test export; a failure here is logged and left to the real translation, which fails loudly.
+    if (diw_translation_enabled(print->full_print_config()) && ! std::getenv("ORCA_DIW_EXPORT_UNTRANSLATED")) {
+        try {
+            std::string raw;
+            {
+                boost::nowide::ifstream in(path_tmp, std::ios::binary);
+                if (! in)
+                    throw Slic3r::RuntimeError("cannot read " + path_tmp);
+                raw.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            }
+            std::vector<double> added;
+            DIWTranslateOptions opt;
+            opt.layer_added_s = &added;
+            diw_translate_gcode(raw, print->full_print_config(), opt);
+            double total = 0.;
+            for (double v : added)
+                total += v;
+            if (total > 0.) {
+                boost::nowide::ofstream out(path_tmp, std::ios::binary | std::ios::app);
+                const std::string marker = DIW::estimate_marker(total);
+                if (! out.write(marker.data(), std::streamsize(marker.size())))
+                    throw Slic3r::RuntimeError("cannot append to " + path_tmp);
+                out.close();
+                m_processor.set_diw_layer_added_time(std::move(added));
+                BOOST_LOG_TRIVIAL(info) << "DIW estimate: added time " << total << " s in the time estimate";
+            }
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(warning) << "DIW estimate: the translator added time is not in the estimate (" << e.what() << ")";
+        }
+    }
 
     m_processor.finalize(true);
     BOOST_LOG_TRIVIAL(info) << "DIW export timing: export_ms="
@@ -10479,6 +10517,7 @@ std::string GCode::extrusion_role_to_string_for_parser(const ExtrusionRole & rol
         case erSupportMaterialInterface: return "SupportMaterialInterface";
         case erSupportTransition: return "SupportTransition";
         case erWipeTower: return "WipeTower";
+        case erPowder: return "Powder";
         case erCustom:
         case erMixed:
         case erCount:

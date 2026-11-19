@@ -22,7 +22,7 @@ the existing `diw_k_screw` = 3.48 (`TranslatorParams::k_screw`), the same consta
 
 * A mode `incremental` = 3 (`TranslatorParams::kAIncremental`) beside flow_scaled 0, proportional 1, cumulative 2.
   It is the default of `diw_a_axis_mode` (`PrintConfig.cpp`: `s_keys_map_DIWAxisAMode`, `enum_values`, default).
-  `PrintConfig.hpp` is untouched (reserved for increment 7): the option is an enum generic, so the new value
+  `PrintConfig.hpp` was untouched in that increment (increment 7 added the three keys below): the option is an enum generic, so the new value
   needs no member.
 * `DIWTranslator.cpp`, `Translator::motion_block`: an extrusion block writes `B<dB> A<dA>` as deltas:
   dA = K_E*dE (`diw_k_screw`) and dB = 0.001225*kB*dE (the existing `delta_b`). Retraction writes a negative dB and
@@ -44,7 +44,7 @@ the existing `diw_k_screw` = 3.48 (`TranslatorParams::k_screw`), the same consta
   the wiper and curing blocks carry XYZ and M62/G04 words only. So no `G90.2 ... G91.2` wrap was needed (it would
   only add a mode switch inside the file); the macros are correct as they are.
 * Settings (`DIWTranslateOptions`, CLI flags of `diw_translate`; tolerant reads of `diw_m62_pre_dwell`,
-  `diw_suckback_length`, `diw_suckback_feed` in `diw_read_translator_params` for when increment 7 adds the members):
+  `diw_suckback_length`, `diw_suckback_feed` in `diw_read_translator_params` now real PrintConfig members, default 0, since increment 7):
   `m62_pre_dwell` (`--m62-dwell s`, `insert_m62_dwell`, applied after `finalize()`), suck-back
   (`suckback_e`, `suckback_f`; `Translator::suckback_lines` at the end of an extrusion, `reprime_lines` before the
   next, B only, no A), `retract_f_max` (`--retract-f-max`). All default off / unchanged.
@@ -64,7 +64,7 @@ the existing `diw_k_screw` = 3.48 (`TranslatorParams::k_screw`), the same consta
 
 * The audit's incremental mode (G91.2) is implemented (the user's choice). The earlier absolute (G90.2) variant was replaced.
 * K_E = 3.48 is a placeholder until the auger calibration gives the real value.
-* The new settings are CLI/translator options only; they become GUI/preset keys in increment 7 (needs `PrintConfig.hpp`).
+* Increment 7: `diw_m62_pre_dwell`, `diw_suckback_length`, `diw_suckback_feed` are printer preset keys (Tab.cpp, "Syringe pump (B axis)"); the CLI flags and env vars override them.
 * The audit's optional calibrated reverse dA after an extrusion is not implemented (the re-prime adds no reverse A).
 
 ## Results

@@ -22,7 +22,7 @@ records, `seam_slope_type` forced off, validation rules".
 - Decided product defaults stay (v2 parity): generated XY travel feed 3000 mm/min; soft limits unconfigured with
   v2's warning; automatic role-based core classification (no explicit N_bottom / N_top). B from the volume to
   extrude; UV, wipe and compaction are fixed sequences; the powder nozzle is an offset tool of the main extruder.
-- Out of scope: preview / time estimate of the powder stages / Powder role colour (increment 7), added time and
+- Done in increment 7: preview / time estimate of the powder stages / Powder role colour. Out of scope: added time and
   powder mass report (increment 6).
 
 ---

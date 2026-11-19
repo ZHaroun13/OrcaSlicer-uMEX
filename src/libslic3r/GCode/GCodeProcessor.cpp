@@ -23,6 +23,7 @@
 #include "libslic3r/I18N.hpp"
 #include "libslic3r_version.h"
 #include "GCodeProcessor.hpp"
+#include "DIWPowderBlock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -747,7 +748,7 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
                 std::nullopt
             });
         }
-        g1_times_cache.push_back({ block.g1_line_id, block.remaining_internal_g1_lines, float(time) });
+        g1_times_cache.push_back({ block.g1_line_id, block.remaining_internal_g1_lines, float(time), block.layer_id });
         // update times for remaining time to printer stop placeholders
         auto it_stop_time = std::lower_bound(stop_times.begin(), stop_times.end(), block.g1_line_id,
             [](const StopTime& t, unsigned int value) { return t.g1_line_id < value; });
@@ -3755,6 +3756,8 @@ void GCodeProcessor::reset()
 
     m_line_id = 0;
     m_last_line_id = 0;
+    m_diw_block.clear();
+    m_diw_in_block = false;
     m_feedrate = 0.0f;
     m_width = 0.0f;
     m_height = 0.0f;
@@ -4001,6 +4004,8 @@ void GCodeProcessor::finalize(bool post_process)
     // calculate_time early-returns with fewer than two queued blocks (see calculate_time).
     calculate_time(m_result, 0, 0.0f, EMoveType::Noop, /*is_final=*/true);
 
+    apply_diw_added_time();
+
     // process the time blocks
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
         TimeMachine& machine = m_time_processor.machines[i];
@@ -4027,6 +4032,49 @@ void GCodeProcessor::finalize(bool post_process)
     update_exclusion_volume_path_check_result();
     //BBS: update slice warning
     update_slice_warnings();
+}
+
+// DIW / u-MEX increment 7: the translator's stages (wipe, UV, powder, compaction, pressure relief) add time the
+// slicer's motion planner does not see. The per-layer added time is applied after the final calculate_time, so the
+// planner's own times and junction handling are untouched: it is added to the last move of each layer (the stages run
+// at the end of their layer), to the machine total, to the first layer time and, as an offset, to the elapsed times of
+// the G1 cache that the M73 lines are written from.
+void GCodeProcessor::apply_diw_added_time()
+{
+    if (m_diw_layer_added_s.empty())
+        return;
+    unsigned int max_layer = 1;
+    for (const GCodeProcessorResult::MoveVertex &mv : m_result.moves)
+        max_layer = std::max(max_layer, mv.layer_id + 1);
+    std::vector<double> d(size_t(max_layer) + 1, 0.);   // by 1-based layer id
+    for (size_t k = 0; k < m_diw_layer_added_s.size(); ++k)
+        d[std::min<size_t>(std::max<size_t>(1, k), max_layer)] += m_diw_layer_added_s[k];
+    double total = 0.;
+    for (double v : d)
+        total += v;
+    std::vector<size_t> last_move(d.size(), size_t(-1));
+    for (size_t i = 0; i < m_result.moves.size(); ++i)
+        last_move[std::min<size_t>(m_result.moves[i].layer_id + 1, max_layer)] = i;
+    for (size_t m = 0; m < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++m) {
+        TimeMachine &machine = m_time_processor.machines[m];
+        if (! machine.enabled)
+            continue;
+        machine.time += total;
+        machine.first_layer_time += float(d[1]);
+        for (size_t k = 1; k < d.size(); ++k)
+            if (d[k] != 0. && last_move[k] != size_t(-1))
+                m_result.moves[last_move[k]].time[m] += float(d[k]);
+        std::vector<double> before(d.size() + 1, 0.);   // before[k] = added time of the layers below k
+        for (size_t k = 1; k < d.size(); ++k)
+            before[k + 1] = before[k] + d[k];
+        for (size_t i = 0; i < machine.g1_times_cache.size(); ++i) {
+            TimeMachine::G1LinesCacheItem &it = machine.g1_times_cache[i];
+            const size_t k = std::min<size_t>(std::max<unsigned int>(1, it.layer_id), max_layer);
+            const bool last_of_layer = i + 1 == machine.g1_times_cache.size() ||
+                                       std::min<size_t>(std::max<unsigned int>(1, machine.g1_times_cache[i + 1].layer_id), max_layer) != k;
+            it.elapsed_time += float(before[k] + (last_of_layer ? d[k] : 0.));
+        }
+    }
 }
 
 double GCodeProcessor::get_time(PrintEstimatedStatistics::ETimeMode mode) const
@@ -4420,8 +4468,96 @@ bool GCodeProcessor::get_last_position_from_gcode(const std::string &gcode_str, 
     return is_z_changed;
 }
 
+bool GCodeProcessor::process_diw_record(const std::string_view comment)
+{
+    constexpr std::string_view tag = "DIW:";
+    if (comment.substr(0, tag.size()) != tag)
+        return false;
+    std::string_view c = comment;
+    while (! c.empty() && (c.back() == '\n' || c.back() == '\r'))
+        c.remove_suffix(1);
+    if (c.substr(0, 9) == "DIW:BEGIN") {
+        m_diw_block.clear();
+        m_diw_in_block = true;
+    }
+    if (m_diw_in_block) {
+        m_diw_block += ';';
+        m_diw_block.append(c.data(), c.size());
+        m_diw_block += '\n';
+        if (c.substr(0, 7) == "DIW:END") {
+            m_diw_in_block = false;
+            store_diw_powder_vertices();
+            m_diw_block.clear();
+        }
+    }
+    return true;
+}
+
+// The powder hatch of a ;DIW: block, in the part's own XY (the powder head offset is added by the translator, not
+// drawn). A block that does not parse is skipped here; the translator reports it and fails the export. The vertices
+// have no time, no extrusion volume and no filament, so no statistic or estimate changes. Each run is drawn as a
+// Travel to its start, Powder segments, and a Travel back to where the last real move ended, so the next real move
+// is drawn from its own start.
+void GCodeProcessor::store_diw_powder_vertices()
+{
+    if (m_result.moves.empty())
+        return;
+    const DIW::ParsedRecords recs = DIW::parse_records(m_diw_block);
+    if (! recs.errors.empty())
+        return;
+    const GCodeProcessorResult::MoveVertex last = m_result.moves.back();
+    const unsigned int layer = std::max<unsigned int>(1, m_layer_id) - 1;
+    auto push = [&](EMoveType type, ExtrusionRole role, double x, double y, float z, float width, float height, float feed) {
+        GCodeProcessorResult::MoveVertex v;
+        v.gcode_id        = m_line_id;
+        v.type            = type;
+        v.extrusion_role  = role;
+        v.extruder_id     = last.extruder_id;
+        v.cp_color_id     = last.cp_color_id;
+        v.position        = Vec3f(float(x) + m_x_offset, float(y) + m_y_offset, z);
+        v.feedrate        = feed;
+        v.width           = width;
+        v.height          = height;
+        v.fan_speed       = last.fan_speed;
+        v.temperature     = last.temperature;
+        v.layer_duration  = 0.f;
+        v.layer_id        = layer;
+        v.object_label_id = last.object_label_id;
+        v.print_z         = last.print_z;
+        m_result.moves.push_back(v);
+    };
+    for (const DIW::PowderLayerRec &b : recs.blocks) {
+        const float z      = float(b.z);
+        const float width  = b.s > 0. ? float(b.s) : 1.f;
+        const float height = float(b.h);
+        const float feed   = float(b.F / 60.);
+        for (const DIW::PowderRunRec &r : b.runs) {
+            if (r.pts.empty())
+                continue;
+            push(EMoveType::Travel, erNone, r.pts.front().first, r.pts.front().second, z, 0.f, 0.f, feed);
+            if (r.point) {
+                // a point dwell: a short mark, 0.4 mm along X
+                push(EMoveType::Extrude, erPowder, r.pts.front().first + 0.4, r.pts.front().second, z, width, height, feed);
+            } else {
+                for (size_t i = 1; i < r.pts.size(); ++i)
+                    push(EMoveType::Extrude, erPowder, r.pts[i].first, r.pts[i].second, z, width, height, feed);
+            }
+            m_result.moves.push_back(last);
+            m_result.moves.back().type        = EMoveType::Travel;
+            m_result.moves.back().extrusion_role = erNone;
+            m_result.moves.back().time        = { 0.f, 0.f };
+            m_result.moves.back().delta_extruder = 0.f;
+            m_result.moves.back().mm3_per_mm  = 0.f;
+            m_result.moves.back().travel_dist = 0.f;
+        }
+    }
+}
+
 void GCodeProcessor::process_tags(const std::string_view comment, bool producers_enabled)
 {
+    if (process_diw_record(comment))
+        return;
+
     // producers tags
     if (producers_enabled && process_producers_tags(comment))
         return;
