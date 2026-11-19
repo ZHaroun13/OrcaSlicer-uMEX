@@ -65,6 +65,13 @@ struct DIWTranslateOptions
     double retract_f_max = -1.;
     // A axis mode (DIWAxisAMode number, 3 = incremental); < 0 = the config's diw_a_axis_mode.
     int a_mode = -1;
+
+    // Increment 6 report (diw/POWDER_PLAN.md): the translated file ends with comment lines giving the powder mass and
+    // the added time (GCode/DIWPowderReport). Off here so every byte-parity harness keeps v2's bytes; the slicer's
+    // export (diw_translate_gcode_file) and diw_translate --report turn it on. Comments only: no motion byte changes.
+    bool append_report = false;
+    // When not null, receives the report's summary lines (no leading ';') whether or not append_report is set.
+    std::vector<std::string> *report_lines = nullptr;
 };
 
 // Translates G-code text. Line endings of the output are '\n'. Throws DIWConfigError

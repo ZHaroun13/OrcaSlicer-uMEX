@@ -11,6 +11,9 @@
 //   --v2-parity                 a non-carrier st=open block is left as paste with v2's warning instead of
 //                               stopping the translation (DIWTranslateOptions::v2_parity; tests that translate
 //                               records made by v2 only, PRODUCT_DESIGN.md 5.3)
+//   --report                    append the added-time and powder-mass report as comment lines to the output and print
+//                               them on stdout as "DIW report: ..." (DIWTranslateOptions::append_report; off by default
+//                               so the v2 parity runs keep their bytes, POWDER_PLAN.md increment 6)
 //   --product-defaults          keep the product default A mode (incremental, G91.2). Without it this tool uses v2's flow_scaled
 //                               unless diw_a_axis_mode is given (override or config block), so the v2 gates stay valid
 //   --m62-dwell <s>             G04 before every M62 (audit #8; DIWTranslateOptions::m62_pre_dwell)
@@ -452,6 +455,8 @@ int main(int argc, char **argv)
             opts.stub_powder_stage = true;
         else if (a == "--v2-parity")
             opts.v2_parity = true;
+        else if (a == "--report")
+            opts.append_report = true;   // increment 6: report comments in the footer + summary on stdout
         else if (a == "--product-defaults")
             g_product_defaults = true;
         else if (a == "--m62-dwell" && i + 1 < argc)
@@ -554,10 +559,18 @@ int main(int argc, char **argv)
         std::string in;
         if (! read_file(args[0], in))
             return 1;
+        std::vector<std::string> report;
+        if (opts.append_report)
+            opts.report_lines = &report;
         const std::string out = diw_translate_gcode(in, cfg, opts);
         boost::nowide::ofstream f(args[1], std::ios::binary | std::ios::trunc);
         f.write(out.data(), std::streamsize(out.size()));
-        return f ? 0 : 1;
+        if (! f)
+            return 1;
+        std::string summary;
+        for (const std::string &l : report)
+            summary += "DIW report: " + l + "\n";
+        return summary.empty() ? 0 : write_stdout(summary);
     } catch (const DIWConfigError &ex) {
         boost::nowide::cerr << "error: " << ex.what() << "\n";
         return 3;

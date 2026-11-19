@@ -31,7 +31,7 @@ needed until milestone 5.
 | 3b | S4 powder emission from records (milestone 4); byte-identical with v2's own plans as records on all fixtures | **done** |
 | 4 | Slicer-core planner in shadow mode (records written by `GCode.cpp`, nothing suppressed); tolerance tests vs v2, clearance invariant, perturbation test, seam-gap 15 % test | **done** (18 Nov 2026): built and verified on the 191-slice matrix, T5 and the 10.1 stress variants; see "Increment 4 results" |
 | 5 | Product path: sparse infill suppressed on core layers, translator requires valid records, `seam_slope_type` forced off, validation rules | **done** (19 Nov 2026): product mode is the export default; its translated output equals shadow mode's on 228 slices; see "Increment 5 results" |
-| 6 | Added time and powder mass reported at export; documentation | |
+| 6 | Added time and powder mass reported at export; documentation | **done** (19 Nov 2026): comment-only footer in the exported G-code, log lines, `diw_translate --report`; see "Increment 6 results" |
 | 7 | Milestone 5 (one full rebuild): preview / time estimate read the records, Powder role colour | |
 
 ## Increment 1 results (17 Nov 2026)
@@ -457,6 +457,50 @@ Final build: `build_slicer_diw.ps1 --no-configure`, `SLICER EXIT CODE 0`, `OrcaS
 Logs are in the session scratchpad `product/`: `progress/stage1.md` ... `stage7.md` (every measured number with
 its log path), `t0_s1` ... `t0_s7` (T0), `s1` (T7, G6, coverage), `s2` (T11), `s3` (T12, G9), `s4` (G5, G6, T7),
 `s5` (S0, G1, G3, G10, G5 rerun), `s6` (G2, G1 (d), G7, G8) and `s7` (G4, samples).
+
+## Increment 6 results (19 Nov 2026)
+
+What it does: the exporter measures the translated G-code and reports the time the u-MEX stages add and the powder mass.
+It reads text only (`GCode/DIWPowderReport`), so the motion bytes cannot change.
+
+**Added time** (nominal feed, no acceleration, so it is a lower bound) is summed from the translated text:
+
+- every `G04 P<s>` dwell, by where it sits: inside a UV window (`M62 <uv pin> Q1` ... `Q0`) it is UV, inside a powder
+  window it is powder feed, inside a compaction window or stage S5 it is compaction, in S1 end it is pressure relief,
+  anywhere else "other dwells" (the M62 pre/post dwells; a `G4` that was already in the slicer input is counted here too);
+- every `G0/G1/G2/G3` move in S2 (wipe), S3 (UV), S4 (powder: transit, hop and hatch) and S5 (compaction) at its 3D length / F.
+  A paste-mode UV cure counts the `G0` just before UV-on and the `G0` just after UV-off as UV.
+
+The parts (pressure relief, wipe, UV, powder feed, compaction, other) add up to the total; the same total is also split
+into dwells and moves.
+
+**Powder mass** = `diw_powder_mass_flow` (g/min) / 60 * deposition seconds. A powder window `M62 <powder pin> Q1`, `G04 <lag_on>`,
+moves, `Q0` deposits for (window time - lag_on + lag_off). The feeder stops d_early = F/60 * lag_off before the end of the run
+(the translator already does this), so a hatch run deposits for length / F; a point dwell deposits for max(t_feed, lag_off).
+A paste job has no powder window and reports 0 g.
+
+**Where it is reported**: (1) comment lines after the safe-shutdown block of the exported file (`; --- uMEX report: ... ---`
+... `; --- end of uMEX report ---`, no brackets or parentheses, so PlanetCNC reads them as comments); (2) the slicer log
+(`DIW report: ...`); (3) `diw_translate --report` (footer and stdout). The footer is off by default
+(`DIWTranslateOptions::append_report = false`), so T0 and the v2-parity runs, which do not pass `--report`, keep their bytes;
+the production export turns it on. The slicer's own estimate line is repeated with the added time added to it
+(`slicer estimate = 9m 04s, with added time = 20m 30s`). The slicer's estimate does not yet include the u-MEX stages
+(increment 7 teaches the preview and the estimate about them).
+
+Cube25 product export (powder, default profile): powder mass 15.0527 g, deposition 144.737 s at 6.240 g/min over 32 layers
+(32 feeder passes), added time 686.281 s = pressure relief 6.4, wipe 119.911, UV 219.593, powder feed 227.95,
+compaction 112.427, other 0 s; dwells 306.2 s, moves 380.081 s. Hand check: a separate script summed the window times of the 32
+`M62 P5` windows in the exported file: 144.737 s, and 6.24 / 60 * 144.737 = 15.0527 g.
+
+Files: `GCode/DIWPowderReport.{hpp,cpp}` (new), `GCode/DIWTranslator.{hpp,cpp}` (option, footer, log),
+`dev-utils/diw_translate.cpp` (`--report`), `src/libslic3r/CMakeLists.txt`, five Catch2 cases `[diw_planner][report]` in
+`tests/libslic3r/test_diw_planner.cpp` (hand-computed fixture, zero powder means zero mass, parts sum to the total,
+malformed M62/G04 fails with the line number, footer is comments only and the bytes before it are unchanged).
+No config key was added (`PrintConfig.hpp` untouched).
+
+Gates: Catch2 `diw_planner_tests` 60 cases, 4851 assertions pass; T0 sequencer 157/157 and 157/157 (stub), records 486,
+powder 0 failures, v2 0 failures; `audit_gate.py` on cube25 0 failures; full slicer build `SLICER EXIT CODE: 0`;
+G5 78 checks, 0 failures; G6 117 checks, 0 failures.
 
 ## Open questions (current defaults keep v2 parity)
 

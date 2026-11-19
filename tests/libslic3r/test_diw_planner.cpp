@@ -3,11 +3,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/GCode/DIWPowderPlanner.hpp"
+#include "libslic3r/GCode/DIWPowderReport.hpp"
 #include "libslic3r/GCode/DIWPyCompat.hpp"
 #include "libslic3r/GCode/DIWTranslator.hpp"
 #include "libslic3r/PrintConfig.hpp"
@@ -616,4 +618,143 @@ TEST_CASE("audit fix: retract feed clamp setting", "[diw_planner][audit]")
     o.retract_f_max = 120.;
     CHECK(def == Catch::Approx(300.));
     CHECK(retract_f(audit_translate(o)) == Catch::Approx(120.));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Increment 6: added time and powder mass report (diw/POWDER_PLAN.md, GCode/DIWPowderReport).
+
+namespace {
+
+// Translated-text fixture, hand computed (nominal feed, mm/min; pins: powder 5, compaction 6, UV 3; m_dot 6 g/min,
+// lag_on = lag_off = 0.15 s). Start (0,0,0).
+//   S1 end   G04 0.2                                              relief   0.2
+//   S2       Z+6 @6000 0.06, X+10 @3000 0.2, X+30 @3000 0.6       wipe     0.86
+//   S3       XY 40 @3000 0.8, UV dwell 5                          UV       5.8
+//   S4       Z-4 @6000 0.04, X-30 @3000 0.6, lag 0.15, 22.5 mm @3000 0.45, 7.5 mm @3000 0.15,
+//            point window G04 0.35                                powder   1.74
+//   S5       Z+2 @6000 0.02, G04 3.0, G04 0.5                     compaction 3.52
+//   paste UV G0 60 mm @3000 1.2 each way, dwell 5                 UV      +7.4
+//   G04 0.1 outside any stage                                     other    0.1
+// Powder windows: 0.15 + 0.45 = 0.6 s -> deposits 0.6 - 0.15 + 0.15 = 0.6 s (the run is 30 mm at 3000 mm/min = 0.6 s);
+// point window 0.35 s -> 0.35 s. Deposition 0.95 s, mass 6 / 60 * 0.95 = 0.095 g.
+const char *REPORT_FIXTURE =
+    "G90\nG0 X0 Y0 Z0 F6000\n"
+    "; --- uMEX L2 S1 end: auger stop, pressure-relief dwell ---\nG04 P0.200\n"
+    "; --- uMEX L2 S2 nozzle wipe ---\nG0 Z6.000 F6000\nG0 X10.000 Y0.000 F3000\nG1 X40.000 F3000\n"
+    "; --- uMEX L2 S3 UV cure at bounding-box centre + offset ---\nG90\nG0 X40.000 Y40.000 F3000\nM62 P3 Q1\nG04 P5.00\nM62 P3 Q0\n"
+    "; --- uMEX L2 S4 powder infill F=3000.0 d_early=7.500 ---\nG0 Z2.000 F6000\nG0 X10.000 Y40.000 F3000\nM62 P5 Q1\nG04 P0.150\n"
+    "G1 X32.500 Y40.000 F3000\nM62 P5 Q0\nG1 X40.000 Y40.000 F3000\n"
+    "; point dwell\nM62 P5 Q1\nG04 P0.350\nM62 P5 Q0\n"
+    "; --- uMEX L2 S5 vibration compaction ---\nG0 Z4.000 F6000\nM62 P6 Q1\nG04 P3.000\nM62 P6 Q0\nG04 P0.500\n"
+    "; --- uMEX L2 S6 layer advance (next layer sets Z) ---\n;LAYER_CHANGE\n"
+    "G90\nG0 X100.000 Y40.000 F3000\nM62 P3 Q1\nG04 P5.00\nM62 P3 Q0\nG0 X40.000 Y40.000 F3000\n"
+    "G1 X41.000 Y40.000 F1200\nG04 P0.100\n"
+    "; estimated printing time (normal mode) = 10m 51s\n";
+
+DIW::PowderReportParams report_params()
+{
+    DIW::PowderReportParams p;
+    p.powder_pin = 5; p.comp_pin = 6; p.uv_pin = 3;
+    p.m_dot = 6.; p.lag_on = 0.15; p.lag_off = 0.15;
+    return p;
+}
+
+} // namespace
+
+TEST_CASE("report: hand-computed fixture", "[diw_planner][report]")
+{
+    const DIW::PowderReport r = DIW::analyze_translated_gcode(REPORT_FIXTURE, report_params());
+    CHECK(r.part_s[DIW::PowderReport::PressureRelief] == Catch::Approx(0.2).margin(1e-9));
+    CHECK(r.part_s[DIW::PowderReport::Wipe]           == Catch::Approx(0.86).margin(1e-9));
+    CHECK(r.part_s[DIW::PowderReport::Uv]             == Catch::Approx(13.2).margin(1e-9));
+    CHECK(r.part_s[DIW::PowderReport::PowderFeed]     == Catch::Approx(1.74).margin(1e-9));
+    CHECK(r.part_s[DIW::PowderReport::Compaction]     == Catch::Approx(3.52).margin(1e-9));
+    CHECK(r.part_s[DIW::PowderReport::Other]          == Catch::Approx(0.1).margin(1e-9));
+    CHECK(r.total_s() == Catch::Approx(19.62).margin(1e-9));
+    CHECK(r.dwell_s   == Catch::Approx(14.3).margin(1e-9));
+    CHECK(r.move_s    == Catch::Approx(5.32).margin(1e-9));
+    CHECK(r.powder_layers == 1);
+    CHECK(r.powder_windows == 2);
+    CHECK(r.powder_deposition_s == Catch::Approx(0.95).margin(1e-9));
+    CHECK(r.powder_mass_g == Catch::Approx(0.095).margin(1e-9));
+    CHECK(r.slicer_estimate_s == Catch::Approx(651.).margin(1e-9));
+    const std::string footer = DIW::report_footer(r);
+    CHECK(footer.find("; powder mass = 0.0950 g\n") != std::string::npos);
+    CHECK(footer.find("; added time = 19.620 s, 20s\n") != std::string::npos);
+    CHECK(footer.find("slicer estimate = 10m 51s, with added time = 11m 11s") != std::string::npos);
+}
+
+TEST_CASE("report: no powder means zero powder mass", "[diw_planner][report]")
+{
+    // a paste job: start-up UV flicker, a positioned UV cure, no powder stage, no feeder window
+    const char *paste =
+        "G90\nM62 P3 Q1 ; UV Self-Check ON\nG04 P3.00 ; Hold for 3 seconds\nM62 P3 Q0 ; UV Self-Check OFF\n"
+        "G1 X10 Y10 F1200\nG1 X20 Y10 B0.01 A1.0\n"
+        "G90\nG0 X20.000 Y90.000 F3000\nM62 P3 Q1\nG04 P5.00\nM62 P3 Q0\nG0 X20.000 Y10.000 F3000\n";
+    DIW::PowderReportParams p = report_params();
+    p.powder_pin = p.comp_pin = -1;   // a paste job has neither
+    const DIW::PowderReport r = DIW::analyze_translated_gcode(paste, p);
+    CHECK(r.powder_mass_g == 0.);
+    CHECK(r.powder_deposition_s == 0.);
+    CHECK(r.powder_windows == 0);
+    CHECK(r.powder_layers == 0);
+    CHECK(r.part_s[DIW::PowderReport::PowderFeed] == 0.);
+    // UV: 3 s flicker (no move around it), 80 mm out and 80 mm back @3000 = 1.6 s each way, 5 s dwell
+    CHECK(r.part_s[DIW::PowderReport::Uv] == Catch::Approx(3. + 5. + 1.6 + 1.6).margin(1e-9));
+    CHECK(r.total_s() == Catch::Approx(11.2).margin(1e-9));
+    CHECK(DIW::report_footer(r).find("; powder mass = 0.0000 g\n") != std::string::npos);
+    // an empty file reports zero everything
+    const DIW::PowderReport e = DIW::analyze_translated_gcode("", report_params());
+    CHECK(e.total_s() == 0.);
+    CHECK(e.powder_mass_g == 0.);
+}
+
+TEST_CASE("report: the parts sum to the total", "[diw_planner][report]")
+{
+    const DIW::PowderReport r = DIW::analyze_translated_gcode(REPORT_FIXTURE, report_params());
+    double parts = 0.;
+    for (int i = 0; i < DIW::PowderReport::PartCount; ++i)
+        parts += r.part_s[i];
+    CHECK(parts == Catch::Approx(r.total_s()).margin(1e-12));
+    CHECK(r.dwell_s + r.move_s == Catch::Approx(r.total_s()).margin(1e-9));
+    // the footer prints the same numbers: the six listed parts add up to the listed total (3-decimal rounding)
+    double listed = 0.;
+    for (const std::string &l : DIW::report_summary_lines(r))
+        if (l.rfind("added time by part:", 0) == 0)
+            for (size_t sp = l.find(" s"); sp != std::string::npos; sp = l.find(" s", sp + 1)) {
+                const size_t b = l.rfind(' ', sp - 1);
+                listed += std::stod(l.substr(b + 1, sp - b - 1));
+            }
+    CHECK(listed == Catch::Approx(r.total_s()).margin(0.003));
+}
+
+TEST_CASE("report: malformed M62 or G04 fails with the line number", "[diw_planner][report]")
+{
+    CHECK_THROWS_WITH(DIW::analyze_translated_gcode("G90\nM62 P3\n", report_params()), Catch::Matchers::ContainsSubstring("line 2"));
+    CHECK_THROWS_WITH(DIW::analyze_translated_gcode("G04\n", report_params()), Catch::Matchers::ContainsSubstring("line 1"));
+}
+
+TEST_CASE("report: footer is comments only and leaves the translation bytes unchanged", "[diw_planner][report]")
+{
+    DynamicPrintConfig cfg = DynamicPrintConfig::full_print_config();
+    cfg.set_key_value("diw_printer", new ConfigOptionBool(true));
+    const std::string plain = diw_translate_gcode(AUDIT_SRC, cfg, DIWTranslateOptions());
+    DIWTranslateOptions opts;
+    opts.append_report = true;
+    std::vector<std::string> lines;
+    opts.report_lines = &lines;
+    const std::string with = diw_translate_gcode(AUDIT_SRC, cfg, opts);
+    REQUIRE(with.size() > plain.size());
+    CHECK(with.compare(0, plain.size(), plain) == 0);   // the motion bytes are the translation, byte for byte
+    std::istringstream is(with.substr(plain.size()));
+    int n = 0;
+    for (std::string l; std::getline(is, l); ++n)
+        CHECK(l.rfind("; ", 0) == 0);
+    CHECK(n >= 4);
+    CHECK(! lines.empty());
+    CHECK(with.find("; powder mass = 0.0000 g\n") != std::string::npos);   // a paste job has no powder
+    // no bracket or parenthesis, so PlanetCNC reads the lines as plain comments
+    CHECK(with.substr(plain.size()).find_first_of("[]()") == std::string::npos);
+    // off by default: no footer
+    CHECK(plain.find("uMEX report") == std::string::npos);
 }

@@ -3,12 +3,14 @@
 #include "DIWUMexParams.hpp"
 #include "DIWUMexSequencer.hpp"
 #include "DIWPowderBlock.hpp"
+#include "DIWPowderReport.hpp"
 
 #include "../Exception.hpp"
 #include "../LocalesUtils.hpp"
 #include "../PrintConfig.hpp"
 #include "../Utils.hpp"
 
+#include <boost/log/trivial.hpp>
 #include <boost/nowide/fstream.hpp>
 
 #include <algorithm>
@@ -1055,7 +1057,19 @@ std::string diw_translate_gcode(const std::string &gcode, const DynamicPrintConf
     if (opts.retract_f_max > 0.) pp.max_retract_f = opts.retract_f_max;
     if (opts.a_mode >= 0) pp.a_mode = opts.a_mode;
     Translator t(pp, opts.stub_powder_stage, opts.v2_parity);
-    return t.run(lines, blocks);
+    std::string result = t.run(lines, blocks);
+    if (opts.append_report || opts.report_lines != nullptr) {
+        // Increment 6: the report reads the finished text, so it cannot change a motion byte; it is appended as comments.
+        const DIW::PowderReport rep = DIW::analyze_translated_gcode(result, DIW::powder_report_params(pp));
+        if (opts.report_lines != nullptr)
+            *opts.report_lines = DIW::report_summary_lines(rep);
+        if (opts.append_report) {
+            if (! result.empty() && result.back() != '\n')
+                result += '\n';
+            result += DIW::report_footer(rep);
+        }
+    }
+    return result;
 }
 
 void diw_translate_gcode_file(const std::string &path, const DynamicPrintConfig &config)
@@ -1069,7 +1083,14 @@ void diw_translate_gcode_file(const std::string &path, const DynamicPrintConfig 
         ss << in.rdbuf();
         gcode = ss.str();
     }
-    const std::string translated = diw_translate_gcode(gcode, config);
+    // The slicer's export carries the powder mass and added time report in the footer (increment 6).
+    DIWTranslateOptions opts;
+    opts.append_report = true;
+    std::vector<std::string> report;
+    opts.report_lines = &report;
+    const std::string translated = diw_translate_gcode(gcode, config, opts);
+    for (const std::string &l : report)
+        BOOST_LOG_TRIVIAL(info) << "DIW report: " << l;
     if (translated.size() == gcode.size() && translated == gcode)
         return;
     boost::nowide::ofstream out(path, std::ios::binary | std::ios::trunc);

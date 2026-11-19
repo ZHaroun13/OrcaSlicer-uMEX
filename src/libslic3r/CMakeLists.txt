@@ -264,6 +264,8 @@ set(lisbslic3r_sources
     GCode/DIWPowderBlock.hpp
     GCode/DIWPowderPlanner.cpp
     GCode/DIWPowderPlanner.hpp
+    GCode/DIWPowderReport.cpp
+    GCode/DIWPowderReport.hpp
     GCode/DIWPowderShadow.cpp
     GCode/DIWPowderShadow.hpp
     GCode/DIWPyCompat.cpp
