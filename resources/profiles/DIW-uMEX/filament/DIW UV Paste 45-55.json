@@ -1,0 +1,55 @@
+{
+	"type": "filament",
+	"name": "DIW UV Paste 45-55",
+	"inherits": "Generic PLA @System",
+	"from": "system",
+	"setting_id": "iSA3WU67U9jExEv9",
+	"filament_id": "OFWSsnhK",
+	"instantiation": "true",
+	"fan_max_speed": [
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0"
+	],
+	"fan_min_speed": [
+		"0",
+		"0",
+		"0",
+		"0",
+		"0",
+		"0"
+	],
+	"filament_extruder_variant": [
+		"Direct Drive Standard",
+		"Direct Drive High Flow",
+		"Direct Drive Extra High Flow",
+		"Bowden Standard",
+		"Bowden High Flow",
+		"Bowden Extra High Flow"
+	],
+	"filament_flow_ratio": [
+		"1",
+		"1",
+		"1",
+		"1",
+		"1",
+		"1"
+	],
+	"filament_max_volumetric_speed": [
+		"40",
+		"40",
+		"40",
+		"40",
+		"40",
+		"40"
+	],
+	"slow_down_for_layer_cooling": [
+		"0"
+	],
+	"compatible_printers": [
+		"DIW-uMEX Robota Precision 1.4 nozzle"
+	]
+}

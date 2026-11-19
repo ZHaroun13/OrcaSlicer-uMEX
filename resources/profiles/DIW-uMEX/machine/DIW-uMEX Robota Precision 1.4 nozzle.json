@@ -1,0 +1,94 @@
+{
+	"type": "machine",
+	"name": "DIW-uMEX Robota Precision 1.4 nozzle",
+	"inherits": "fdm_machine_common",
+	"from": "system",
+	"setting_id": "W1FSCGE1Irri2IDG",
+	"instantiation": "true",
+	"default_nozzle_volume_type": [
+		"Standard"
+	],
+	"extruder_type": [
+		"Direct Drive"
+	],
+	"extruder_variant_list": [
+		"Direct Drive Standard,Direct Drive High Flow,Direct Drive Extra High Flow"
+	],
+	"printer_extruder_id": [
+		"1",
+		"1",
+		"1"
+	],
+	"printer_extruder_variant": [
+		"Direct Drive Standard",
+		"Direct Drive High Flow",
+		"Direct Drive Extra High Flow"
+	],
+	"printer_model": "DIW-uMEX Robota Precision",
+	"printer_variant": "1.4",
+	"gcode_flavor": "marlin",
+	"machine_end_gcode": "G92 E0.0\nG1 {if max_layer_z < max_print_height}Z{z_offset+min(max_layer_z+30, max_print_height)}{endif} F1500 ; move print head up safely\nG1 X0 Y0 F3000 ; park print head\n",
+	"machine_start_gcode": "G90 ; use absolute coordinates\nM82 ; extruder absolute mode\nG92 E0.0\n; initial load\nG1 X205.0 E19 F300 ; lowered speed to prevent syringe pump stalling\nG1 Y1.6\nG1 X5.0 E19 F300\nG92 E0.0\n; intro line\nG1 Y2.0 Z0.2 F1000\nG1 X65.0 E9.0 F300\nG1 X105.0 E12.5 F300\nG92 E0.0",
+	"max_layer_height": [
+		"1.2"
+	],
+	"retraction_length": [
+		"0.9",
+		"0.9",
+		"0.9"
+	],
+	"retraction_minimum_travel": [
+		"1",
+		"1",
+		"1"
+	],
+	"retraction_speed": [
+		"45",
+		"45",
+		"45"
+	],
+	"deretraction_speed": [
+		"35",
+		"35",
+		"35"
+	],
+	"wipe": [
+		"0",
+		"0",
+		"0"
+	],
+	"z_hop": [
+		"0.4",
+		"0.4",
+		"0.4"
+	],
+	"nozzle_diameter": [
+		"1.4"
+	],
+	"printable_area": [
+		"0x0",
+		"140x0",
+		"140x140",
+		"0x140"
+	],
+	"printable_height": "30",
+	"before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\n",
+	"enable_filament_ramming": "0",
+	"min_layer_height": [
+		"0.2"
+	],
+	"nozzle_type": [
+		"brass",
+		"brass",
+		"brass"
+	],
+	"purge_in_prime_tower": "0",
+	"retract_length_toolchange": [
+		"0",
+		"0",
+		"0"
+	],
+	"single_extruder_multi_material": "0",
+	"support_chamber_temp_control": "0",
+	"use_relative_e_distances": "0"
+}

@@ -1,0 +1,12 @@
+{
+	"type": "machine_model",
+	"name": "DIW-uMEX Robota Precision",
+	"model_id": "diw_umex_robota_01",
+	"nozzle_diameter": "1.4",
+	"machine_tech": "FFF",
+	"family": "DIW-uMEX",
+	"bed_model": "",
+	"bed_texture": "orcaslicer_bed_texture.svg",
+	"hotend_model": "",
+	"default_materials": "DIW UV Paste 45-55"
+}

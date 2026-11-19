@@ -1,0 +1,42 @@
+{
+	"name": "DIW-uMEX",
+	"version": "02.05.01.00",
+	"force_update": "0",
+	"description": "DIW-uMEX direct-ink-writing printer, process and filament presets",
+	"machine_model_list": [
+		{
+			"name": "DIW-uMEX Robota Precision",
+			"sub_path": "machine/DIW-uMEX Robota Precision.json"
+		}
+	],
+	"process_list": [
+		{
+			"name": "fdm_process_common",
+			"sub_path": "process/fdm_process_common.json"
+		},
+		{
+			"name": "fdm_process_marlin_common",
+			"sub_path": "process/fdm_process_marlin_common.json"
+		},
+		{
+			"name": "DIW-uMEX 0.7mm Core-Shell",
+			"sub_path": "process/DIW-uMEX 0.7mm Core-Shell.json"
+		}
+	],
+	"filament_list": [
+		{
+			"name": "DIW UV Paste 45-55",
+			"sub_path": "filament/DIW UV Paste 45-55.json"
+		}
+	],
+	"machine_list": [
+		{
+			"name": "fdm_machine_common",
+			"sub_path": "machine/fdm_machine_common.json"
+		},
+		{
+			"name": "DIW-uMEX Robota Precision 1.4 nozzle",
+			"sub_path": "machine/DIW-uMEX Robota Precision 1.4 nozzle.json"
+		}
+	]
+}
